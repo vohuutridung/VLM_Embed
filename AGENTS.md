@@ -13,17 +13,19 @@ pip install -r requirements.txt
 python fix_lib.py   # patches a Qwen2-VL image processor bug in transformers
 ```
 
-**`fix_lib.py` is mandatory after install.** It comments out lines 140-143 in `transformers/models/qwen2_vl/image_processing_qwen2_vl.py` inside the venv. Without this, Qwen2-VL models will crash on image preprocessing. The line numbers differ between Python 3.11 and 3.12 venvs — the script targets 3.11; adjust `file_path` in fix_lib.py if you use 3.12.
+**`fix_lib.py` is mandatory after install.** It comments out lines 140-143 in `transformers/models/qwen2_vl/image_processing_qwen2_vl.py` inside the venv. Without this, Qwen2-VL models will crash on image preprocessing.
 
 ## Data
 
 Training images must be at `vlm2vec_train/MMEB-train/images/`. Download via:
+
 ```bash
 bash download_traindata.sh
 bash download_traindata_2.sh
 ```
 
 Eval images go in `eval_images/`:
+
 ```bash
 wget https://huggingface.co/datasets/TIGER-Lab/MMEB-eval/resolve/main/images.zip
 unzip images.zip -d eval_images/
@@ -32,6 +34,7 @@ unzip images.zip -d eval_images/
 ## Training
 
 Three training entrypoints with different distributed setups:
+
 - `train.py` — standard HF Trainer (single GPU or DDP via accelerate)
 - `train_distillation.py` — DeepSpeed-based distillation (`deepspeed` launcher)
 - `train_distill_ddp.py` — pure torch DDP distillation (`torchrun` launcher)
@@ -40,6 +43,7 @@ Three training entrypoints with different distributed setups:
 All shell scripts in `scripts/` use `torchrun` (calls `train_distill_no_deepspeed.py` or `train_distill_ddp.py`), except `scripts/train_distill.sh` which uses `deepspeed` (calls `train_distillation.py`).
 
 Key distillation arguments (via `--kd_loss_type`):
+
 - `contrastive_rkd` — RKD distance+angle distillation
 - `proposal_dtw` — proposal loss with DTW alignment + projector
 - `span_propose`, `span_propose_attn`, `span_propose_attn_only_phrase` — span-based losses
