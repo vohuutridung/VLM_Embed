@@ -1,7 +1,7 @@
 from huggingface_hub import upload_folder
 
 # 🪪 Access token của bạn
-token = "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"
+token = ""
 
 # 📁 Thư mục bạn muốn upload (ví dụ: model, checkpoints, v.v.)
 folder_path = "/workspace/ComfyUI/models/gligen/VLM_Embed/training/no_deepspeed_propose_kd_weight/checkpoint-final"
