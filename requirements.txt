@@ -20,7 +20,7 @@ ray
 timm
 sentencepiece
 opencv-python
-decord
+eva-decord # for macos, return to decord as original
 hnswlib
 einops
 deepspeed==0.17.6
