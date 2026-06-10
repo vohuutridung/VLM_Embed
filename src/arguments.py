@@ -125,6 +125,7 @@ class TrainingArguments(TrainingArguments):
     w_loss_v: float = field(default=1.0, metadata={"help": "weight for vision Grassman loss"})
     w_loss_t: float = field(default=1.0, metadata={"help": "weight for text Grassman loss"})
     w_loss_cross: float = field(default=1.0, metadata={"help": "weight for cross-modal Grassman loss"})
+    w_loss_batch: float = field(default=1.0, metadata={"help": "weight for batch-level CKA loss"})
 @dataclass
 class MTEBArguments:
     device: str = field(default="cuda", metadata={"help": "use cuda for single GPU inference, if multiple GPUs are available it will use DP automatically"})

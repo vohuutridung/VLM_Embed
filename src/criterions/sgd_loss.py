@@ -475,7 +475,28 @@ def compute_grassman_loss(espace_teacher, espace_student):
     return ((espace_teacher.detach() - espace_student) ** 2).sum()
 
 
-class TokenLevelGrassmanLoss(nn.Module):
+
+class CKALoss(nn.Module):
+    def __init__(self, eps=1e-8):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, SH, TH):
+        dT = TH.size(-1)
+        dS = SH.size(-1)
+        SH = SH.view(-1, dS).to(torch.float64)
+        TH = TH.view(-1, dT).to(torch.float64)
+
+        SH = SH - SH.mean(0, keepdim=True)
+        TH = TH - TH.mean(0, keepdim=True)
+
+        num = torch.norm(SH.t().matmul(TH), 'fro')
+        den1 = torch.norm(SH.t().matmul(SH), 'fro') + self.eps
+        den2 = torch.norm(TH.t().matmul(TH), 'fro') + self.eps
+
+        return 1 - num / torch.sqrt(den1 * den2)
+
+class SGDLoss(nn.Module):
     def __init__(self, args):
         super().__init__()
 
@@ -497,6 +518,7 @@ class TokenLevelGrassmanLoss(nn.Module):
         self.w_loss_v = getattr(args, 'w_loss_v', 1.0)
         self.w_loss_t = getattr(args, 'w_loss_t', 1.0)
         self.w_loss_cross = getattr(args, 'w_loss_cross', 1.0)
+        self.w_loss_batch = getattr(args, 'w_loss_batch', 1.0)
 
     def _dist_gather_tensor(self, t):
         """Gather tensor từ tất cả các process"""
@@ -610,59 +632,94 @@ class TokenLevelGrassmanLoss(nn.Module):
 
         return loss_v, loss_t, loss_cross, valid_v, valid_t, valid_cross
 
-    def forward(self, distiller, input_data):
-        student_model = distiller.student
-        teacher_model = distiller.teacher
 
-        student_qry_input = input_data['student_inputs']['qry']
-        student_pos_input = input_data['student_inputs']['pos']
-        teacher_qry_input = input_data['teacher_inputs']['qry']
-        teacher_pos_input = input_data['teacher_inputs']['pos']
-        qry_image_sizes = input_data.get('qry_image_sizes', None)
-        pos_image_sizes = input_data.get('pos_image_sizes', None)
+    def compute_batch_level_loss(self, input_data, 
+                                 teacher_qry_attention, teacher_pos_attention,
+                                 student_qry_attention, student_pos_attention,
+                                 teacher_qry_hidden_states, teacher_pos_hidden_states,
+                                 student_qry_hidden_states, student_pos_hidden_states):
+        device = input_data['student_inputs']['qry']['input_ids'].device
+        batch_size = input_data['student_inputs']['qry']['input_ids'].size(0)
+        cka_fn_loss = CKALoss(eps=1e-8).to(device)
 
-        # Đếm số text tokens (loại bỏ image tokens)
-        # Giả sử image token IDs nằm trong khoảng [151643, 151656]
-        num_text_qry_tokens = ((teacher_qry_input['input_ids'] < 151643) | (teacher_qry_input['input_ids'] > 151656)).sum(dim=1)
-        num_text_pos_tokens = ((teacher_pos_input['input_ids'] < 151643) | (teacher_pos_input['input_ids'] > 151656)).sum(dim=1)
+        BOS_TOKEN_ID = 151643
+        
+        teacher_qry_input_ids = input_data['teacher_inputs']['qry']['input_ids']
+        teacher_pos_input_ids = input_data['teacher_inputs']['pos']['input_ids']
+        student_qry_input_ids = input_data['student_inputs']['qry']['input_ids']
+        student_pos_input_ids = input_data['student_inputs']['pos']['input_ids']
 
-        batch_size = student_qry_input['input_ids'].size(0)
-        device = student_qry_input['input_ids'].device
+        teacher_qry_attn_mask = input_data['teacher_inputs']['qry'].get('attention_mask', torch.ones_like(teacher_qry_input_ids))
+        teacher_pos_attn_mask = input_data['teacher_inputs']['pos'].get('attention_mask', torch.ones_like(teacher_pos_input_ids))
+        student_qry_attn_mask = input_data['student_inputs']['qry'].get('attention_mask', torch.ones_like(student_qry_input_ids))
+        student_pos_attn_mask = input_data['student_inputs']['pos'].get('attention_mask', torch.ones_like(student_pos_input_ids))
 
-        # Forward teacher
-        with torch.no_grad():
-            teacher_model.eval()
-            teacher_qry_output = teacher_model.encode_input(teacher_qry_input)
-            teacher_pos_output = teacher_model.encode_input(teacher_pos_input)
-            teacher_qry_reps, teacher_qry_image_features, _, teacher_qry_hidden_states = teacher_qry_output
-            teacher_pos_reps, teacher_pos_image_features, _, teacher_pos_hidden_states = teacher_pos_output
+        t_qry_atten = teacher_qry_attention[-1].mean(dim=1)
+        t_pos_atten = teacher_pos_attention[-1].mean(dim=1)
+        s_qry_atten = student_qry_attention[-1].mean(dim=1)
+        s_pos_atten = student_pos_attention[-1].mean(dim=1)
 
-        # Forward student
-        student_qry_output = student_model.encode_input(student_qry_input)
-        student_pos_output = student_model.encode_input(student_pos_input)
-        student_qry_reps, student_qry_image_features, _, student_qry_hidden_states = student_qry_output
-        student_pos_reps, student_pos_image_features, _, student_pos_hidden_states = student_pos_output
+        t_qry_importance = t_qry_atten.sum(dim=1)
+        t_pos_importance = t_pos_atten.sum(dim=1)
+        s_qry_importance = s_qry_atten.sum(dim=1)
+        s_pos_importance = s_pos_atten.sum(dim=1)
 
-        # Contrastive loss
-        if self.world_size > 1:
-            all_student_qry_reps = self._dist_gather_tensor(student_qry_reps)
-            all_student_pos_reps = self._dist_gather_tensor(student_pos_reps)
-        else:
-            all_student_qry_reps = student_qry_reps
-            all_student_pos_reps = student_pos_reps
+        t_qry_hidden = teacher_qry_hidden_states[-1]
+        t_pos_hidden = teacher_pos_hidden_states[-1]
+        s_qry_hidden = student_qry_hidden_states[-1]
+        s_pos_hidden = student_pos_hidden_states[-1]
 
-        scores = student_model.compute_similarity(all_student_qry_reps, all_student_pos_reps)
-        scores = scores.view(all_student_qry_reps.size(0), -1)
-        target = torch.arange(scores.size(0), device=scores.device, dtype=torch.long)
-        target = target * (all_student_qry_reps.size(0) // all_student_pos_reps.size(0))
-        contrastive_loss = nn.CrossEntropyLoss()(scores / distiller.temperature, target)
+        t_qry_reps, t_pos_reps = [], []
+        s_qry_reps, s_pos_reps = [], []
 
-        # RKD loss (distance loss + angle loss)
-        rkd_loss = (
-            self.compute_distance_loss(student_qry_reps, student_pos_reps, teacher_qry_reps, teacher_pos_reps)
-            + self.compute_angle_loss(student_qry_reps, student_pos_reps, teacher_qry_reps, teacher_pos_reps)
-        ) / 2.0
+        for i in range(batch_size):
+            t_qry_ids = teacher_qry_input_ids[i]
+            t_pos_ids = teacher_pos_input_ids[i]
+            s_qry_ids = student_qry_input_ids[i]
+            s_pos_ids = student_pos_input_ids[i]
 
+            t_qry_mask = (teacher_qry_attn_mask[i].bool()) & (t_qry_ids != BOS_TOKEN_ID)
+            t_pos_mask = (teacher_pos_attn_mask[i].bool()) & (t_pos_ids != BOS_TOKEN_ID)
+            s_qry_mask = (student_qry_attn_mask[i].bool()) & (s_qry_ids != BOS_TOKEN_ID)
+            s_pos_mask = (student_pos_attn_mask[i].bool()) & (s_pos_ids != BOS_TOKEN_ID)
+
+            t_qry_w = t_qry_importance[i] * t_qry_mask.float()
+            t_pos_w = t_pos_importance[i] * t_pos_mask.float()
+            s_qry_w = s_qry_importance[i] * s_qry_mask.float()
+            s_pos_w = s_pos_importance[i] * s_pos_mask.float()
+
+            if t_qry_w.sum() > 0: t_qry_w = t_qry_w / t_qry_w.sum()
+            if t_pos_w.sum() > 0: t_pos_w = t_pos_w / t_pos_w.sum()
+            if s_qry_w.sum() > 0: s_qry_w = s_qry_w / s_qry_w.sum()
+            if s_pos_w.sum() > 0: s_pos_w = s_pos_w / s_pos_w.sum()
+
+            t_qry_rep = (t_qry_hidden[i] * t_qry_w.unsqueeze(-1)).sum(dim=0)
+            t_pos_rep = (t_pos_hidden[i] * t_pos_w.unsqueeze(-1)).sum(dim=0)
+            s_qry_rep = (s_qry_hidden[i] * s_qry_w.unsqueeze(-1)).sum(dim=0)
+            s_pos_rep = (s_pos_hidden[i] * s_pos_w.unsqueeze(-1)).sum(dim=0)
+
+            t_qry_reps.append(t_qry_rep)
+            t_pos_reps.append(t_pos_rep)
+            s_qry_reps.append(s_qry_rep)
+            s_pos_reps.append(s_pos_rep)
+
+        t_qry_reps = torch.stack(t_qry_reps)
+        t_pos_reps = torch.stack(t_pos_reps)
+        s_qry_reps = torch.stack(s_qry_reps)
+        s_pos_reps = torch.stack(s_pos_reps)
+
+        loss_qry = cka_fn_loss(s_qry_reps, t_qry_reps)
+        loss_pos = cka_fn_loss(s_pos_reps, t_pos_reps)
+
+        return (loss_qry + loss_pos) / 2
+
+    def compute_token_level_loss(self, batch_size, device,
+                                 num_text_qry_tokens, num_text_pos_tokens,
+                                 student_qry_image_features, teacher_qry_image_features,
+                                 student_pos_image_features, teacher_pos_image_features,
+                                 student_qry_hidden_states, teacher_qry_hidden_states,
+                                 student_pos_hidden_states, teacher_pos_hidden_states,
+                                 qry_image_sizes, pos_image_sizes):
         total_loss_v = total_loss_t = total_loss_cross = 0.0
         valid_vision_samples = valid_text_samples = valid_cross_modal_samples = 0
 
@@ -722,12 +779,86 @@ class TokenLevelGrassmanLoss(nn.Module):
             + self.w_loss_t * grassman_loss_t
             + self.w_loss_cross * grassman_loss_cross
         )
-        total_loss = contrastive_loss + self.args.kd_weight * grassman_loss + (self.args.kd_weight / 10.0) * rkd_loss
+        return grassman_loss, grassman_loss_v, grassman_loss_t, grassman_loss_cross
+
+    def forward(self, distiller, input_data):
+        student_model = distiller.student
+        teacher_model = distiller.teacher
+
+        student_qry_input = input_data['student_inputs']['qry']
+        student_pos_input = input_data['student_inputs']['pos']
+        teacher_qry_input = input_data['teacher_inputs']['qry']
+        teacher_pos_input = input_data['teacher_inputs']['pos']
+        qry_image_sizes = input_data.get('qry_image_sizes', None)
+        pos_image_sizes = input_data.get('pos_image_sizes', None)
+
+        # Đếm số text tokens (loại bỏ image tokens)
+        # Giả sử image token IDs nằm trong khoảng [151643, 151656]
+        num_text_qry_tokens = ((teacher_qry_input['input_ids'] < 151643) | (teacher_qry_input['input_ids'] > 151656)).sum(dim=1)
+        num_text_pos_tokens = ((teacher_pos_input['input_ids'] < 151643) | (teacher_pos_input['input_ids'] > 151656)).sum(dim=1)
+
+        batch_size = student_qry_input['input_ids'].size(0)
+        device = student_qry_input['input_ids'].device
+
+        # Forward teacher
+        with torch.no_grad():
+            teacher_model.eval()
+            teacher_qry_output = teacher_model.encode_input(teacher_qry_input)
+            teacher_pos_output = teacher_model.encode_input(teacher_pos_input)
+            teacher_qry_reps, teacher_qry_image_features, teacher_qry_attention, teacher_qry_hidden_states = teacher_qry_output
+            teacher_pos_reps, teacher_pos_image_features, teacher_pos_attention, teacher_pos_hidden_states = teacher_pos_output
+
+        # Forward student
+        student_qry_output = student_model.encode_input(student_qry_input)
+        student_pos_output = student_model.encode_input(student_pos_input)
+        student_qry_reps, student_qry_image_features, student_qry_attention, student_qry_hidden_states = student_qry_output
+        student_pos_reps, student_pos_image_features, student_pos_attention, student_pos_hidden_states = student_pos_output
+
+        # Contrastive loss
+        if self.world_size > 1:
+            all_student_qry_reps = self._dist_gather_tensor(student_qry_reps)
+            all_student_pos_reps = self._dist_gather_tensor(student_pos_reps)
+        else:
+            all_student_qry_reps = student_qry_reps
+            all_student_pos_reps = student_pos_reps
+
+        scores = student_model.compute_similarity(all_student_qry_reps, all_student_pos_reps)
+        scores = scores.view(all_student_qry_reps.size(0), -1)
+        target = torch.arange(scores.size(0), device=scores.device, dtype=torch.long)
+        target = target * (all_student_qry_reps.size(0) // all_student_pos_reps.size(0))
+        contrastive_loss = nn.CrossEntropyLoss()(scores / distiller.temperature, target)
+
+        # RKD loss (distance loss + angle loss)
+        rkd_loss = (
+            self.compute_distance_loss(student_qry_reps, student_pos_reps, teacher_qry_reps, teacher_pos_reps)
+            + self.compute_angle_loss(student_qry_reps, student_pos_reps, teacher_qry_reps, teacher_pos_reps)
+        ) / 2.0
+
+        token_level_loss, grassman_loss_v, grassman_loss_t, grassman_loss_cross = self.compute_token_level_loss(
+            batch_size, device,
+            num_text_qry_tokens, num_text_pos_tokens,
+            student_qry_image_features, teacher_qry_image_features,
+            student_pos_image_features, teacher_pos_image_features,
+            student_qry_hidden_states, teacher_qry_hidden_states,
+            student_pos_hidden_states, teacher_pos_hidden_states,
+            qry_image_sizes, pos_image_sizes
+        )
+        
+        batch_level_loss = self.compute_batch_level_loss(
+            input_data, 
+            teacher_qry_attention, teacher_pos_attention,
+            student_qry_attention, student_pos_attention,
+            teacher_qry_hidden_states, teacher_pos_hidden_states,
+            student_qry_hidden_states, student_pos_hidden_states
+        )
+
+        total_loss = contrastive_loss + self.args.kd_weight * (token_level_loss + self.w_loss_batch * batch_level_loss) + (self.args.kd_weight / 10.0) * rkd_loss
 
         return {
             'loss': total_loss,
             'contrastive_loss': contrastive_loss,
-            'grassman_loss': grassman_loss,
+            'token_level_loss': token_level_loss,
+            'batch_level_loss': batch_level_loss,
             'grassman_loss_v': grassman_loss_v,
             'grassman_loss_t': grassman_loss_t,
             'grassman_loss_cross': grassman_loss_cross,
