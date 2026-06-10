@@ -366,11 +366,18 @@ def compute_weighted_cluster_mean(hidden_states, cluster_info, token_weights):
 
 # ====== Grassman loss helpers ======
 
-def select_topk_text_tokens_by_attn(text_to_vision_attn, ratio):
-    attn_t2v_value = text_to_vision_attn.sum(dim=1)
-    k = max(1, int(ratio * text_to_vision_attn.size(0)))
-    k = min(k, text_to_vision_attn.size(0))
-    _, topk_indices = torch.topk(attn_t2v_value, k)
+def select_topk_text_tokens_by_last_token_cosine(text_hidden, ratio):
+    """Chọn top-k text tokens theo cosine similarity với last text token (trên teacher)."""
+    num_text = text_hidden.size(0)
+    k = max(1, int(ratio * num_text))
+    k = min(k, num_text)
+
+    last_token = text_hidden[-1]  # (D,)
+    text_norm = F.normalize(text_hidden, p=2, dim=-1)
+    last_norm = F.normalize(last_token.unsqueeze(0), p=2, dim=-1)
+    cos_scores = (text_norm * last_norm).sum(dim=-1)  # (num_text,)
+
+    _, topk_indices = torch.topk(cos_scores, k)
     return topk_indices
 
 
@@ -451,8 +458,8 @@ def compute_laplacian_eigenspace(W, num_eigenvectors, laplacian_type="unnormaliz
     except Exception:
         return torch.eye(n, device=W.device, dtype=W.dtype)
 
-    U = eigenvectors[:, 1:1 + k_eig].to(W.dtype)
-    return U @ U.T
+    U = eigenvectors[:, 1:1 + k_eig].to(W.dtype) # (n, k_eig), eigenmap
+    return U @ U.T # (n, n), eigenspace
 
 
 def compute_grassman_loss(espace_teacher, espace_student):
@@ -502,8 +509,7 @@ class TokenLevelGrassmanLoss(nn.Module):
 
     def _compute_sample_grassman_loss(self, s_text_hidden, t_text_hidden,
                                       s_vision_hidden, t_vision_hidden,
-                                      teacher_attn_list, num_text,
-                                      has_image, original_width, original_height):
+                                      num_text, has_image, original_width, original_height):
         """Tính loss Grassman cho một sample"""
         device = (
             s_text_hidden.device if s_text_hidden is not None
@@ -576,16 +582,9 @@ class TokenLevelGrassmanLoss(nn.Module):
 
         # ===== Text tokens =====
         if num_text > 0 and t_text_hidden is not None and s_text_hidden is not None:
-            if has_image and teacher_attn_list is not None:
-                last_attn = teacher_attn_list[-1]
-                if last_attn is not None:
-                    topk_indices = select_topk_text_tokens_by_attn(last_attn, self.topk_text_ratio)
-                    h_t_t = t_text_hidden[topk_indices]
-                    h_s_t = s_text_hidden[topk_indices]
-                else:
-                    h_t_t, h_s_t = t_text_hidden, s_text_hidden
-            else:
-                h_t_t, h_s_t = t_text_hidden, s_text_hidden
+            topk_indices = select_topk_text_tokens_by_last_token_cosine(t_text_hidden, self.topk_text_ratio)
+            h_t_t = t_text_hidden[topk_indices]
+            h_s_t = s_text_hidden[topk_indices]
 
             if h_t_t.size(0) >= 2:
                 W_t = build_knn_weight_matrix(h_t_t, self.knn_neighbors)
@@ -635,8 +634,8 @@ class TokenLevelGrassmanLoss(nn.Module):
             teacher_model.eval()
             teacher_qry_output = teacher_model.encode_input(teacher_qry_input)
             teacher_pos_output = teacher_model.encode_input(teacher_pos_input)
-            teacher_qry_reps, teacher_qry_image_features, teacher_qry_attention, teacher_qry_hidden_states = teacher_qry_output
-            teacher_pos_reps, teacher_pos_image_features, teacher_pos_attention, teacher_pos_hidden_states = teacher_pos_output
+            teacher_qry_reps, teacher_qry_image_features, _, teacher_qry_hidden_states = teacher_qry_output
+            teacher_pos_reps, teacher_pos_image_features, _, teacher_pos_hidden_states = teacher_pos_output
 
         # Forward student
         student_qry_output = student_model.encode_input(student_qry_input)
@@ -668,14 +667,14 @@ class TokenLevelGrassmanLoss(nn.Module):
         valid_vision_samples = valid_text_samples = valid_cross_modal_samples = 0
 
         for i in range(batch_size):
-            # for sample is query or positive
+            # for sample in [query, positive]
             for side_args in (
                 (num_text_qry_tokens[i].item(), student_qry_image_features, teacher_qry_image_features,
-                 student_qry_hidden_states, teacher_qry_hidden_states, teacher_qry_attention, qry_image_sizes),
+                 student_qry_hidden_states, teacher_qry_hidden_states, qry_image_sizes),
                 (num_text_pos_tokens[i].item(), student_pos_image_features, teacher_pos_image_features,
-                 student_pos_hidden_states, teacher_pos_hidden_states, teacher_pos_attention, pos_image_sizes),
+                 student_pos_hidden_states, teacher_pos_hidden_states, pos_image_sizes),
             ):
-                num_text, s_img_feats, t_img_feats, s_hidden, t_hidden, t_attention, image_sizes = side_args
+                num_text, s_img_feats, t_img_feats, s_hidden, t_hidden, image_sizes = side_args
 
                 has_image = (s_img_feats is not None and i < len(s_img_feats) and s_img_feats[i] is not None)
                 num_vision_student = s_img_feats[i].size(0) if has_image else 0
@@ -695,7 +694,7 @@ class TokenLevelGrassmanLoss(nn.Module):
                     t_hidden, i, num_text, num_vision_teacher, is_teacher=True, has_image=has_image,
                 )[-1] if num_text > 0 else None
 
-                s_vision_last = t_vision_last = teacher_attn_list = None
+                s_vision_last = t_vision_last = None
                 if has_image:
                     s_vision_last = extract_vision_hidden_states(
                         s_hidden, i, num_vision_student, num_text, is_teacher=False,
@@ -703,14 +702,10 @@ class TokenLevelGrassmanLoss(nn.Module):
                     t_vision_last = extract_vision_hidden_states(
                         t_hidden, i, num_vision_teacher, num_text, is_teacher=True,
                     )[-1]
-                    teacher_attn_list = extract_attention_for_sample(
-                        t_attention, i, num_vision_teacher, num_text,
-                        is_teacher=True,
-                    )
 
                 lv, lt, lc, vv, vt, vc = self._compute_sample_grassman_loss(
                     s_text_last, t_text_last, s_vision_last, t_vision_last,
-                    teacher_attn_list, num_text, has_image, img_w, img_h,
+                    num_text, has_image, img_w, img_h,
                 )
                 total_loss_v += lv
                 total_loss_t += lt
