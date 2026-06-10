@@ -118,6 +118,13 @@ class TrainingArguments(TrainingArguments):
     )
     w_cross_modal_loss: float = field(default=1.0, metadata={"help": "weight for cross modal loss"})
     min_samples_dbscan_teacher: int = field(default=2, metadata={"help": "min_samples for DBSCAN when clustering teacher features for span loss"})
+    topk_text_ratio: float = field(default=0.3, metadata={"help": "ratio of top-k text tokens selected by attention"})
+    knn_neighbors: int = field(default=10, metadata={"help": "number of neighbors for kNN graph construction"})
+    num_eigenvectors: int = field(default=16, metadata={"help": "number of eigenvectors for Laplacian Eigenmaps (excluding v_0)"})
+    laplacian_type: str = field(default="unnormalized", metadata={"help": "type of Laplacian: unnormalized or normalized"})
+    w_loss_v: float = field(default=1.0, metadata={"help": "weight for vision Grassman loss"})
+    w_loss_t: float = field(default=1.0, metadata={"help": "weight for text Grassman loss"})
+    w_loss_cross: float = field(default=1.0, metadata={"help": "weight for cross-modal Grassman loss"})
 @dataclass
 class MTEBArguments:
     device: str = field(default="cuda", metadata={"help": "use cuda for single GPU inference, if multiple GPUs are available it will use DP automatically"})
