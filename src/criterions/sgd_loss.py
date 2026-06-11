@@ -482,6 +482,7 @@ class CKALoss(nn.Module):
         self.eps = eps
 
     def forward(self, SH, TH):
+        # SH: student hidden states, TH: teacher hidden states
         dT = TH.size(-1)
         dS = SH.size(-1)
         SH = SH.view(-1, dS).to(torch.float64)
@@ -515,6 +516,7 @@ class SGDLoss(nn.Module):
         self.knn_neighbors = getattr(args, 'knn_neighbors', 10)
         self.num_eigenvectors = getattr(args, 'num_eigenvectors', 16)
         self.laplacian_type = getattr(args, 'laplacian_type', 'unnormalized')
+        self.kd_weight = getattr(args, 'kd_weight', 1.0)
         self.w_loss_v = getattr(args, 'w_loss_v', 1.0)
         self.w_loss_t = getattr(args, 'w_loss_t', 1.0)
         self.w_loss_cross = getattr(args, 'w_loss_cross', 1.0)
@@ -532,7 +534,7 @@ class SGDLoss(nn.Module):
     def _compute_sample_grassman_loss(self, s_text_hidden, t_text_hidden,
                                       s_vision_hidden, t_vision_hidden,
                                       num_text, has_image, original_width, original_height):
-        """Tính loss Grassman cho một sample"""
+        """Tính loss Grassman cho một sample trong batch"""
         device = (
             s_text_hidden.device if s_text_hidden is not None
             else s_vision_hidden.device if s_vision_hidden is not None
@@ -633,11 +635,12 @@ class SGDLoss(nn.Module):
         return loss_v, loss_t, loss_cross, valid_v, valid_t, valid_cross
 
 
-    def compute_batch_level_loss(self, input_data, 
+    def _compute_batch_level_loss(self, input_data, 
                                  teacher_qry_attention, teacher_pos_attention,
                                  student_qry_attention, student_pos_attention,
                                  teacher_qry_hidden_states, teacher_pos_hidden_states,
                                  student_qry_hidden_states, student_pos_hidden_states):
+        # tính batch-level loss trên 1 batch
         device = input_data['student_inputs']['qry']['input_ids'].device
         batch_size = input_data['student_inputs']['qry']['input_ids'].size(0)
         cka_fn_loss = CKALoss(eps=1e-8).to(device)
@@ -713,13 +716,14 @@ class SGDLoss(nn.Module):
 
         return (loss_qry + loss_pos) / 2
 
-    def compute_token_level_loss(self, batch_size, device,
+    def _compute_token_level_loss(self, batch_size, device,
                                  num_text_qry_tokens, num_text_pos_tokens,
                                  student_qry_image_features, teacher_qry_image_features,
                                  student_pos_image_features, teacher_pos_image_features,
                                  student_qry_hidden_states, teacher_qry_hidden_states,
                                  student_pos_hidden_states, teacher_pos_hidden_states,
                                  qry_image_sizes, pos_image_sizes):
+        # tính token-level loss trên 1 batch
         total_loss_v = total_loss_t = total_loss_cross = 0.0
         valid_vision_samples = valid_text_samples = valid_cross_modal_samples = 0
 
@@ -771,15 +775,16 @@ class SGDLoss(nn.Module):
                 valid_text_samples += vt
                 valid_cross_modal_samples += vc
 
-        grassman_loss_v = total_loss_v / valid_vision_samples if valid_vision_samples > 0 else torch.tensor(0.0, device=device)
-        grassman_loss_t = total_loss_t / valid_text_samples if valid_text_samples > 0 else torch.tensor(0.0, device=device)
-        grassman_loss_cross = total_loss_cross / valid_cross_modal_samples if valid_cross_modal_samples > 0 else torch.tensor(0.0, device=device)
-        grassman_loss = (
-            self.w_loss_v * grassman_loss_v
-            + self.w_loss_t * grassman_loss_t
-            + self.w_loss_cross * grassman_loss_cross
+        token_level_loss_v = total_loss_v / valid_vision_samples if valid_vision_samples > 0 else torch.tensor(0.0, device=device)
+        token_level_loss_t = total_loss_t / valid_text_samples if valid_text_samples > 0 else torch.tensor(0.0, device=device)
+        token_level_loss_cross = total_loss_cross / valid_cross_modal_samples if valid_cross_modal_samples > 0 else torch.tensor(0.0, device=device)
+        # token_level_loss = lambda_v * loss_v + lambda_t * loss_t + lambda_cross * loss_cross
+        token_level_loss = (
+            self.w_loss_v * token_level_loss_v
+            + self.w_loss_t * token_level_loss_t
+            + self.w_loss_cross * token_level_loss_cross
         )
-        return grassman_loss, grassman_loss_v, grassman_loss_t, grassman_loss_cross
+        return token_level_loss, token_level_loss_v, token_level_loss_t, token_level_loss_cross
 
     def forward(self, distiller, input_data):
         student_model = distiller.student
@@ -834,7 +839,8 @@ class SGDLoss(nn.Module):
             + self.compute_angle_loss(student_qry_reps, student_pos_reps, teacher_qry_reps, teacher_pos_reps)
         ) / 2.0
 
-        token_level_loss, grassman_loss_v, grassman_loss_t, grassman_loss_cross = self.compute_token_level_loss(
+        # Token-level loss
+        token_level_loss, token_level_loss_v, token_level_loss_t, token_level_loss_cross = self._compute_token_level_loss(
             batch_size, device,
             num_text_qry_tokens, num_text_pos_tokens,
             student_qry_image_features, teacher_qry_image_features,
@@ -844,7 +850,8 @@ class SGDLoss(nn.Module):
             qry_image_sizes, pos_image_sizes
         )
         
-        batch_level_loss = self.compute_batch_level_loss(
+        # Batch-level loss
+        batch_level_loss = self._compute_batch_level_loss(
             input_data, 
             teacher_qry_attention, teacher_pos_attention,
             student_qry_attention, student_pos_attention,
@@ -852,17 +859,22 @@ class SGDLoss(nn.Module):
             student_qry_hidden_states, student_pos_hidden_states
         )
 
-        total_loss = contrastive_loss + self.args.kd_weight * (token_level_loss + self.w_loss_batch * batch_level_loss) + (self.args.kd_weight / 10.0) * rkd_loss
+        total_loss = (
+            contrastive_loss
+            + (self.kd_weight / 10.0) * rkd_loss
+            + self.kd_weight * token_level_loss
+            + self.kd_weight * self.w_loss_batch * batch_level_loss
+        )
 
         return {
             'loss': total_loss,
             'contrastive_loss': contrastive_loss,
-            'token_level_loss': token_level_loss,
+            'rkd_loss': rkd_loss,
             'batch_level_loss': batch_level_loss,
-            'grassman_loss_v': grassman_loss_v,
-            'grassman_loss_t': grassman_loss_t,
-            'grassman_loss_cross': grassman_loss_cross,
-            'kd_loss_rkd': rkd_loss,
+            'token_level_loss': token_level_loss,
+            'token_level_loss_v': token_level_loss_v,
+            'token_level_loss_t': token_level_loss_t,
+            'token_level_loss_cross': token_level_loss_cross,
         }
 
     def pairwise_distance(self, x):

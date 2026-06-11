@@ -97,12 +97,12 @@ class TrainingArguments(TrainingArguments):
     #!new args
     gc_dynamic_limit: int = field(default=125, metadata={"help": "gc_chunk default limit - (128, 125) sized matrices works for Qwen2b. gc_dynamic_limit would be 125 and gc_p|q_chunk_size would be 128"})
     #!new kd loss weight
-    kd_weight: float = field(default=0.01, metadata={"help": "weight of kd loss in total loss"})
     rkd_distance_weight: float = field(default=1.0, metadata={"help": "weight of distance loss in total kd loss"})
     rkd_angle_weight: float = field(default=2.0, metadata={"help": "weight of angle loss in total kd loss"})
     kd_loss_type: str = field(default="contrastive_rkd", metadata={"help": "type of kd loss, current only support RKD"})
     ds_config: str = field(default=None, metadata={"help": "DeepSpeed config json file path"})
     deepspeed_config: str = field(default=None, metadata={"help": "DeepSpeed config json file path"})
+    w_cross_modal_loss: float = field(default=1.0, metadata={"help": "weight for cross modal loss"})
     # new args for span loss
     teacher_layer_mapping: List[int] = field(
         default_factory=list,
@@ -116,7 +116,8 @@ class TrainingArguments(TrainingArguments):
         default_factory=list,
         metadata={"help": "List of split layers for student; number of elements equals number of projectors"}   
     )
-    w_cross_modal_loss: float = field(default=1.0, metadata={"help": "weight for cross modal loss"})
+    #! new args for sgd loss
+    kd_weight: float = field(default=1.0, metadata={"help": "weight of kd loss in total loss"})
     min_samples_dbscan_teacher: int = field(default=2, metadata={"help": "min_samples for DBSCAN when clustering teacher features for span loss"})
     topk_text_ratio: float = field(default=0.3, metadata={"help": "ratio of top-k text tokens selected by attention"})
     knn_neighbors: int = field(default=10, metadata={"help": "number of neighbors for kNN graph construction"})
