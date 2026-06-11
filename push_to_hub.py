@@ -7,7 +7,7 @@ token = ""
 folder_path = "/workspace/ComfyUI/models/gligen/VLM_Embed/training/no_deepspeed_propose_kd_weight/checkpoint-final"
 
 # 🏷️ Repo đã có sẵn trên Hugging Face
-repo_id = "DVLe/vlm_propose_hateful"
+repo_id = "vohuutridung/ten_mo_hinh"
 
 # 🚀 Upload toàn bộ folder lên repo đó
 upload_folder(

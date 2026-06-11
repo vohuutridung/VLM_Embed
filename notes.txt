@@ -1,0 +1,28 @@
+- train: script cls
+- push_to_hf: push_to_hub.py
+- eval: 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+total_loss = (
+    contrastive_loss
+    + (self.kd_weight / 10.0) * rkd_loss
+    + self.kd_weight * token_level_loss
+    + self.kd_weight * self.w_loss_batch * batch_level_loss
+)
+

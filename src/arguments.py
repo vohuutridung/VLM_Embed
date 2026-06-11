@@ -78,7 +78,8 @@ class DataArguments:
     pos_only: bool = field(default=False, metadata={"help": "Only use positives"})
     # new args distillation
     percent_data: float = field(default=1.0, metadata={"help": "percentage of data used for distillation training"})
-    
+    val_split_ratio: float = field(default=0.0, metadata={"help": "fraction of training data held out for validation (0 = no split)"})
+
 
 
 @dataclass
@@ -103,6 +104,9 @@ class TrainingArguments(TrainingArguments):
     ds_config: str = field(default=None, metadata={"help": "DeepSpeed config json file path"})
     deepspeed_config: str = field(default=None, metadata={"help": "DeepSpeed config json file path"})
     w_cross_modal_loss: float = field(default=1.0, metadata={"help": "weight for cross modal loss"})
+    teacher_patch_size: int = field(default=28, metadata={"help": "teacher vision patch size for SGD loss cluster mapping"})
+    student_patch_size: int = field(default=64, metadata={"help": "student vision patch size for SGD loss cluster mapping"})
+    student_resize: int = field(default=1024, metadata={"help": "student image resize for SGD loss cluster mapping"})
     # new args for span loss
     teacher_layer_mapping: List[int] = field(
         default_factory=list,
@@ -127,6 +131,7 @@ class TrainingArguments(TrainingArguments):
     w_loss_t: float = field(default=1.0, metadata={"help": "weight for text Grassman loss"})
     w_loss_cross: float = field(default=1.0, metadata={"help": "weight for cross-modal Grassman loss"})
     w_loss_batch: float = field(default=1.0, metadata={"help": "weight for batch-level CKA loss"})
+    
 @dataclass
 class MTEBArguments:
     device: str = field(default="cuda", metadata={"help": "use cuda for single GPU inference, if multiple GPUs are available it will use DP automatically"})

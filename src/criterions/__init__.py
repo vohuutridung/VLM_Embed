@@ -22,7 +22,6 @@ criterion_list = {
     "span_propose": SpanProposeCriterion,
     "span_propose_attn": SpanProposeCriterionWeighted,
     "span_propose_attn_only_phrase": SpanProposeCriterionWeightedOnlyPhrase,
-    "token_level_grassman": SGDLoss,
     "sgd_loss": SGDLoss,
 }
 
