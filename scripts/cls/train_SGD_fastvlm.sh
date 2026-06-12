@@ -3,7 +3,7 @@
 # GPU per node
 NUM_GPUS_PER_NODE=1
 LORA_R=64
-LORA_A=128
+LORA_A=64
 BATCH_SIZE=16
 
 KD_WEIGHT=1.0
@@ -17,17 +17,19 @@ TRAIN_SCRIPT="main.py"
 EXP_NAME="SGD_FastVLM_full_cls_r${LORA_R}_bs${BATCH_SIZE}"
 USE_FULLSET=true
 
+echo "========================================================="
+echo "Starting Training"
+echo "========================================================="
+
 if [ "$USE_FULLSET" = true ]; then
     SUBSETS=("ImageNet_1K" "N24News" "HatefulMemes" "VOC2007" "SUN397")
-    echo "Running with FULL dataset set."
+    echo "Training with FULL dataset set."
 else
     SUBSETS=("ImageNet_1K")
-    echo "Running with SINGLE dataset (ImageNet_1K)."
+    echo "Training with SINGLE dataset (ImageNet_1K)."
 fi
 
-# =========================================================================
-# Run with torchrun
-# =========================================================================
+
 torchrun --standalone --nproc_per_node=$NUM_GPUS_PER_NODE $TRAIN_SCRIPT \
     --model_name "apple/FastVLM-0.5B" \
     --teacher_model_name "raghavlite/B3_Qwen2_2B" \
@@ -69,3 +71,8 @@ torchrun --standalone --nproc_per_node=$NUM_GPUS_PER_NODE $TRAIN_SCRIPT \
     --image_resolution "low" \
     --report_to "wandb" \
     --run_name "$EXP_NAME"
+
+echo "========================================================="
+echo "Training Completed"
+echo "Results saved in training/$EXP_NAME"
+echo "========================================================="

@@ -9,15 +9,16 @@
 # SUBSET: space-separated subset names, or "all" for full MMEB-eval list
 # =========================================================================
 
+# GPU per node
+NUM_GPUS_PER_NODE=1
 LORA_R=64
-LORA_A=128
+LORA_A=64
 BATCH_SIZE=16
 EXP_NAME="SGD_FastVLM_full_cls_r${LORA_R}_bs${BATCH_SIZE}"
 
 MODEL_PATH="${1:-training/${EXP_NAME}/checkpoint-final}"
 OUTPUT_DIR="${2:-eval_outputs/${EXP_NAME}}"
-SUBSET="${3:-ImageNet-1K N24News HatefulMemes VOC2007 SUN397}"
-# SUBSET="OK-VQA A-OKVQA DocVQA InfographicsVQA ChartQA Visual7W"
+USE_FULLSET=true
 
 echo "========================================================="
 echo "Starting Evaluation"
@@ -26,14 +27,15 @@ echo "Output: ${OUTPUT_DIR}"
 echo "Subset: ${SUBSET}"
 echo "========================================================="
 
-if [ "$SUBSET" == "all" ]; then
-    SUBSETS=("Wiki-SS-NQ" "VisDial" "CIRR" "VisualNews_t2i" "VisualNews_i2t" "MSCOCO_t2i" "MSCOCO_i2t" "NIGHTS" "WebQA" "OVEN" "FashionIQ" "EDIS" "OK-VQA" "A-OKVQA" "DocVQA" "InfographicsVQA" "ChartQA" "Visual7W" "ScienceQA" "GQA" "TextVQA" "VizWiz" "ImageNet-1K" "HatefulMemes" "SUN397" "N24News" "VOC2007" "Place365" "ImageNet-A" "ImageNet-R" "ObjectNet" "Country211" "MSCOCO" "RefCOCO" "RefCOCO-Matching" "Visual7W-Pointing")
+if [ "$USE_FULLSET" == true ]; then
+    SUBSETS=("ImageNet-1K" "N24News" "HatefulMemes" "VOC2007" "SUN397" "Place365" "ImageNet-A" "ImageNet-R" "ObjectNet" "Country211")
+    echo "Evaluating with FULL dataset set."
 else
-    IFS=' ' read -r -a SUBSETS <<< "$SUBSET"
+    SUBSETS=("ImageNet-1K")
+    echo "Evaluating with SINGLE dataset (ImageNet-1K)."
 fi
 
-NUM_GPUS=1
-echo "Detected ${NUM_GPUS} GPU(s)"
+echo "Detected ${NUM_GPUS_PER_NODE} GPU(s)"
 
 EVAL_ARGS=(
     --model_name "${MODEL_PATH}"
@@ -41,7 +43,7 @@ EVAL_ARGS=(
     --dataset_name "TIGER-Lab/MMEB-eval"
     --subset_name "${SUBSETS[@]}"
     --dataset_split "test"
-    --per_device_eval_batch_size 128
+    --per_device_eval_batch_size "${BATCH_SIZE}"
     --image_dir "eval_images/"
     --image_resolution "low"
     --pooling "eos"
