@@ -46,7 +46,7 @@ torchrun --standalone --nproc_per_node=$NUM_GPUS_PER_NODE $TRAIN_SCRIPT \
     --subset_name "${SUBSETS[@]}" \
     --dataset_split "original" \
     --image_dir "vlm2vec_train/MMEB-train" \
-    --percent_data 1.0 \
+    --percent_data 0.5 \
     --output_dir "training/$EXP_NAME" \
     --per_device_train_batch_size $BATCH_SIZE \
     --gradient_accumulation_steps 1 \

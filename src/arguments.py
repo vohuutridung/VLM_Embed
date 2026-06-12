@@ -89,6 +89,7 @@ class TrainingArguments(TrainingArguments):
     resume_from: str = field(default="none", metadata={"help": "`auto` will detect if any previous checkpoints should be resumed. or specify specific step of the checkpoint."})
     project_name: str = field(default=None, metadata={"help": "project name"})
     logging_steps: int = field(default=1, metadata={"help": "logging steps"})
+    eval_steps: int = field(default=0, metadata={"help": "Run validation every N optimizer steps (0 = disabled; end-of-epoch validation still runs when val_split_ratio > 0)"},)
     num_train_epochs: int = field(default=1, metadata={"help": "number of training epochs"})
     grad_cache: bool = field(default=False, metadata={"help": "Use gradient cache update"})
     gc_q_chunk_size: int = field(default=128, metadata={"help": "query side subset size. Should be power of 2"})

@@ -1,8 +1,10 @@
+import json
 import os
 import sys
 import logging
 import time
 from datetime import timedelta
+from typing import Dict, Optional, Tuple
 
 # --- FIX 1: Disable Tokenizer Parallelism/OMP to prevent Deadlock ---
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -36,6 +38,68 @@ logger = logging.getLogger(__name__)
 
 def is_sgd_loss(training_args: TrainingArguments) -> bool:
     return training_args.kd_loss_type == "sgd_loss"
+
+
+# Preferred display order for tqdm / log lines (subset names without train/ prefix).
+KD_LOSS_METRIC_KEYS: Dict[str, Tuple[str, ...]] = {
+    "sgd_loss": (
+        "loss",
+        "contrastive_loss",
+        "rkd_loss",
+        "token_level_loss",
+        "token_level_loss_v",
+        "token_level_loss_t",
+        "token_level_loss_cross",
+        "batch_level_loss",
+    ),
+    "span_propose": (
+        "loss",
+        "contrastive_loss",
+        "span_loss",
+        "text_span_loss",
+        "vision_cluster_loss",
+        "cross_modal_loss",
+        "kd_loss_rkd",
+    ),
+    "span_propose_attn": (
+        "loss",
+        "contrastive_loss",
+        "span_loss",
+        "text_span_loss",
+        "vision_cluster_loss",
+        "cross_modal_loss",
+        "kd_loss_rkd",
+    ),
+    "span_propose_attn_only_phrase": (
+        "loss",
+        "contrastive_loss",
+        "span_loss",
+        "text_span_loss",
+        "vision_cluster_loss",
+        "cross_modal_loss",
+        "kd_loss_rkd",
+    ),
+    "proposal_dtw": (
+        "loss",
+        "contrastive_loss",
+        "kd_loss",
+        "kd_loss_rkd",
+        "kd_loss_dtw",
+        "ot_loss",
+    ),
+    "proposal_proj": (
+        "loss",
+        "contrastive_loss",
+        "kd_loss",
+        "attn_loss",
+        "kd_loss_mse",
+    ),
+    "contrastive_rkd": ("loss", "contrastive_loss", "kd_loss"),
+    "emo_loss": ("loss", "contrastive_loss", "kd_loss", "ot_loss"),
+    "em_kd": ("loss", "contrastive_loss", "kd_loss"),
+    "em_kd_llava_ov": ("loss", "contrastive_loss", "kd_loss"),
+    "universal_logit": ("loss", "contrastive_loss", "kd_loss"),
+}
 
 
 def configure_student_params(distiller: Distiller, training_args: TrainingArguments) -> None:
@@ -89,17 +153,87 @@ def collect_train_metrics(outputs: dict, lr_scheduler, epoch: float) -> dict:
     return metrics
 
 
-def format_tqdm_postfix(metrics: dict, sgd: bool) -> dict:
-    if sgd:
-        keys = ("loss", "token_level_loss", "contrastive_loss", "rkd_loss")
-    else:
-        keys = tuple(k.replace("train/", "") for k in metrics if "loss" in k)
+def _metric_display_keys(metrics: dict, kd_loss_type: str) -> Tuple[str, ...]:
+    if kd_loss_type in KD_LOSS_METRIC_KEYS:
+        return KD_LOSS_METRIC_KEYS[kd_loss_type]
+    dynamic = tuple(
+        k.replace("train/", "")
+        for k in sorted(metrics)
+        if k.startswith("train/") and k not in ("train/lr", "train/epoch")
+    )
+    if "loss" in dynamic:
+        return ("loss",) + tuple(k for k in dynamic if k != "loss")
+    return dynamic
+
+
+def format_tqdm_postfix(metrics: dict, kd_loss_type: str) -> dict:
     postfix = {}
-    for key in keys:
+    for key in _metric_display_keys(metrics, kd_loss_type):
         full_key = f"train/{key}"
-        if full_key in metrics:
-            postfix[key] = f"{metrics[full_key]:.4f}"
+        if full_key not in metrics:
+            continue
+        value = metrics[full_key]
+        if key == "lr":
+            postfix[key] = f"{value:.2e}"
+        else:
+            postfix[key] = f"{value:.4f}"
+    if "train/lr" in metrics:
+        postfix["lr"] = f"{metrics['train/lr']:.2e}"
     return postfix
+
+
+def format_metrics_log_line(global_step: int, metrics: dict) -> str:
+    parts = [f"step={global_step}"]
+    for key in sorted(metrics):
+        short = key.replace("train/", "")
+        value = metrics[key]
+        if short == "lr":
+            parts.append(f"{short}={value:.2e}")
+        elif isinstance(value, float):
+            parts.append(f"{short}={value:.4f}")
+        else:
+            parts.append(f"{short}={value}")
+    return " | ".join(parts)
+
+
+def append_metrics_jsonl(metrics_path: str, global_step: int, metrics: dict, prefix: str = "train") -> None:
+    record = {"step": global_step}
+    record.update({k.replace(f"{prefix}/", ""): v for k, v in metrics.items()})
+    with open(metrics_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+def collect_eval_metrics(outputs: dict) -> Dict[str, float]:
+    metrics = {"eval/loss": outputs["loss"].item()}
+    for k, v in outputs.items():
+        if k != "loss" and isinstance(v, torch.Tensor):
+            metrics[f"eval/{k}"] = v.item()
+    return metrics
+
+
+def format_eval_log_line(global_step: int, epoch: float, metrics: dict) -> str:
+    parts = [f"step={global_step}", f"epoch={epoch:.4f}"]
+    for key in sorted(metrics):
+        short = key.replace("eval/", "")
+        value = metrics[key]
+        if isinstance(value, float):
+            parts.append(f"{short}={value:.4f}")
+        else:
+            parts.append(f"{short}={value}")
+    return "eval | " + " | ".join(parts)
+
+
+def setup_file_logging(output_dir: str) -> Optional[str]:
+    if not is_main_process():
+        return None
+    os.makedirs(output_dir, exist_ok=True)
+    log_path = os.path.join(output_dir, "train.log")
+    file_handler = logging.FileHandler(log_path)
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s")
+    )
+    logger.addHandler(file_handler)
+    return log_path
 
 # ... [Keep setup_logging, ddp_setup, cleanup_ddp, is_main_process, to_device, download_artifacts unchanged] ...
 def setup_logging(training_args: TrainingArguments) -> None:
@@ -225,39 +359,92 @@ def save_checkpoint(
     except Exception:
         pass
 
-# --- NEW FUNCTION: Evaluate Loss ---
-def evaluate_loss(
-    model: nn.Module, 
-    dataloader: DataLoader, 
-    criterion: nn.Module, 
-    device: torch.device
-) -> float:
-    """Computes average loss on the validation set."""
+def evaluate(
+    model: nn.Module,
+    dataloader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+) -> Dict[str, float]:
+    """Computes average validation metrics over the eval dataloader."""
     model.eval()
-    total_loss = 0.0
+    metric_sums: Dict[str, float] = {}
     num_batches = 0
-    
+
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Evaluating", disable=not is_main_process()):
+        for batch in tqdm(dataloader, desc="Validating", disable=not is_main_process()):
             batch = to_device(batch, device)
             outputs = model(criterion, batch)
-            
-            # Extract loss
-            loss = outputs["loss"] if isinstance(outputs, dict) else outputs
-            total_loss += loss.item()
+            if not isinstance(outputs, dict):
+                outputs = {"loss": outputs}
+            batch_metrics = collect_eval_metrics(outputs)
+            for key, value in batch_metrics.items():
+                metric_sums[key] = metric_sums.get(key, 0.0) + value
             num_batches += 1
-            
-    # Calculate average on this device
-    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
-    
-    # If distributed, average across all GPUs
+
+    if num_batches == 0:
+        return {"eval/loss": 0.0}
+
+    avg_metrics = {key: value / num_batches for key, value in metric_sums.items()}
+
     if dist.is_initialized():
-        avg_loss_tensor = torch.tensor(avg_loss, device=device)
-        dist.all_reduce(avg_loss_tensor, op=dist.ReduceOp.SUM)
-        avg_loss = avg_loss_tensor.item() / dist.get_world_size()
-        
-    model.train() # Switch back to train mode
-    return avg_loss
+        for key in avg_metrics:
+            metric_tensor = torch.tensor(avg_metrics[key], device=device)
+            dist.all_reduce(metric_tensor, op=dist.ReduceOp.SUM)
+            avg_metrics[key] = metric_tensor.item() / dist.get_world_size()
+
+    model.train()
+    return avg_metrics
+
+
+def run_validation(
+    distiller: nn.Module,
+    eval_dataloader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+    global_step: int,
+    epoch: float,
+    training_args: TrainingArguments,
+    best_val_loss: float,
+    model_args: ModelArguments,
+    eval_metrics_jsonl_path: Optional[str],
+) -> float:
+    """Run validation, log metrics, and save best checkpoint if improved."""
+    eval_metrics = evaluate(distiller, eval_dataloader, criterion, device)
+    val_loss = eval_metrics.get("eval/loss", float("inf"))
+
+    if is_main_process():
+        logger.info(format_eval_log_line(global_step, epoch, eval_metrics))
+        if "wandb" in training_args.report_to:
+            wandb.log(eval_metrics, step=global_step)
+        if eval_metrics_jsonl_path:
+            record = {"step": global_step, "epoch": epoch}
+            record.update({k.replace("eval/", ""): v for k, v in eval_metrics.items()})
+            with open(eval_metrics_jsonl_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record) + "\n")
+
+        if val_loss < best_val_loss:
+            logger.info(
+                f"New best validation model (loss: {val_loss:.4f} < {best_val_loss:.4f}) "
+                f"-> saving checkpoint-best"
+            )
+            best_val_loss = val_loss
+            save_checkpoint(
+                training_args.output_dir,
+                epoch=int(epoch),
+                distiller=distiller,
+                model_args=model_args,
+                step=global_step,
+                folder_name="checkpoint-best",
+            )
+        else:
+            logger.info(
+                f"Validation loss {val_loss:.4f} did not improve best {best_val_loss:.4f}"
+            )
+
+    if dist.is_initialized():
+        dist.barrier()
+
+    return best_val_loss
 
 def main():
     ddp_setup() # Initialize DDP for distributed training
@@ -271,6 +458,21 @@ def main():
 
     setup_logging(training_args)
     use_sgd_loss = is_sgd_loss(training_args)
+    train_log_path = setup_file_logging(training_args.output_dir)
+    metrics_jsonl_path = (
+        os.path.join(training_args.output_dir, "metrics.jsonl")
+        if is_main_process()
+        else None
+    )
+    eval_metrics_jsonl_path = (
+        os.path.join(training_args.output_dir, "eval_metrics.jsonl")
+        if is_main_process()
+        else None
+    )
+    if train_log_path:
+        logger.info(f"File logging enabled: {train_log_path}")
+    if metrics_jsonl_path or eval_metrics_jsonl_path:
+        os.makedirs(training_args.output_dir, exist_ok=True)
 
     if is_main_process() and "wandb" in training_args.report_to: # Initialize WandB for logging
         wandb.init(
@@ -408,10 +610,17 @@ def main():
         logger.info(f"  Num Epochs = {training_args.num_train_epochs}")
         logger.info(f"  Gradient Accumulation steps = {training_args.gradient_accumulation_steps}")
         logger.info(f"  Total optimization steps = {max_train_steps}")
+        logger.info(f"  Val split ratio = {data_args.val_split_ratio}")
         logger.info(f"  Eval step = {training_args.eval_steps}")
+        logger.info(f"  Output dir = {training_args.output_dir}")
+        if metrics_jsonl_path:
+            logger.info(f"  Train metrics log = {metrics_jsonl_path}")
+        if eval_metrics_jsonl_path:
+            logger.info(f"  Eval metrics log = {eval_metrics_jsonl_path}")
 
     global_step = 0
     best_val_loss = float('inf') # Track best loss
+    last_eval_step = -1
 
     for epoch in range(int(training_args.num_train_epochs)):
         if dist.is_initialized():
@@ -450,40 +659,64 @@ def main():
 
                     if "wandb" in training_args.report_to:
                         wandb.log(metrics, step=global_step)
-                    epoch_iterator.set_postfix(**format_tqdm_postfix(metrics, use_sgd_loss))
+                    logger.info(format_metrics_log_line(global_step, metrics))
+                    if metrics_jsonl_path:
+                        append_metrics_jsonl(metrics_jsonl_path, global_step, metrics)
+                    epoch_iterator.set_postfix(
+                        **format_tqdm_postfix(metrics, training_args.kd_loss_type)
+                    )
 
-                # --- CHANGED: Periodic Evaluation & Best Model Saving ---
-                if eval_dataloader is not None and training_args.eval_steps > 0 and global_step % training_args.eval_steps == 0:
-                    logger.info(f"Step {global_step}: Running evaluation...")
-                    val_loss = evaluate_loss(distiller, eval_dataloader, criterion, device)
-                    
-                    if is_main_process():
-                        logger.info(f"Step {global_step} | Validation Loss: {val_loss:.4f}")
-                        if "wandb" in training_args.report_to:
-                            wandb.log({"eval/loss": val_loss}, step=global_step)
-                        
-                        # Save Best Model
-                        if val_loss < best_val_loss:
-                            logger.info(f"New best model found! (Loss: {val_loss:.4f} < {best_val_loss:.4f})")
-                            best_val_loss = val_loss
-                            save_checkpoint(
-                                training_args.output_dir, 
-                                epoch=epoch+1, 
-                                distiller=distiller, 
-                                model_args=model_args, 
-                                step=global_step, 
-                                folder_name="checkpoint-best"
-                            )
+                # Periodic validation
+                eval_steps = training_args.eval_steps or 0
+                if (
+                    eval_dataloader is not None
+                    and eval_steps > 0
+                    and global_step % eval_steps == 0
+                ):
+                    best_val_loss = run_validation(
+                        distiller,
+                        eval_dataloader,
+                        criterion,
+                        device,
+                        global_step,
+                        epoch + (step + 1) / len(train_dataloader),
+                        training_args,
+                        best_val_loss,
+                        model_args,
+                        eval_metrics_jsonl_path,
+                    )
+                    last_eval_step = global_step
+
+        # End-of-epoch validation (when val split is enabled)
+        if eval_dataloader is not None and last_eval_step != global_step:
+            epoch_progress = epoch + 1
+            best_val_loss = run_validation(
+                distiller,
+                eval_dataloader,
+                criterion,
+                device,
+                global_step,
+                epoch_progress,
+                training_args,
+                best_val_loss,
+                model_args,
+                eval_metrics_jsonl_path,
+            )
 
         # End of epoch Saving
         save_checkpoint(training_args.output_dir, epoch + 1, distiller, model_args)
-        
+        if is_main_process():
+            logger.info(f"Epoch {epoch + 1}/{training_args.num_train_epochs} completed.")
+
         if dist.is_initialized():
             dist.barrier()
 
     logger.info("Training completed.")
-    if is_main_process() and eval_dataloader:
-        logger.info(f"Best Validation Loss: {best_val_loss:.4f}")
+    if is_main_process() and eval_dataloader is not None:
+        if best_val_loss < float("inf"):
+            logger.info(f"Best validation loss: {best_val_loss:.4f} (checkpoint-best)")
+        else:
+            logger.info("Validation was run but no improvement over initial best loss.")
 
     # Final Save
     save_checkpoint(training_args.output_dir, int(training_args.num_train_epochs), distiller, model_args, folder_name="checkpoint-final")
