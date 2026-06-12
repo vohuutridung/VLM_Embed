@@ -1,13 +1,20 @@
-- train: script cls
-- push_to_hf: push_to_hub.py
-- eval: 
+# Setup env (ensure u stay in VLM_Embed)
+uv python install 3.11
+alias python="$(uv python find 3.11)"
+python -m venv vlm
+source vlm/bin/activate
+pip install -r requirements.txt
+python fix_lib.py
 
+# Download train_data (for cls only)
+bash scripts/cls/download_traindata_cls.sh
 
+# Download eval_data
+wget https://huggingface.co/datasets/TIGER-Lab/MMEB-eval/resolve/main/images.zip
+unzip images.zip -d eval_images/
 
-
-
-
-
+# Train
+bash scripts/cls/train_SGD_fastvlm.sh
 
 
 

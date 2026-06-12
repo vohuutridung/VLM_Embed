@@ -15,7 +15,7 @@ W_LOSS_BATCH=1.0
 # Configs
 TRAIN_SCRIPT="main.py"
 EXP_NAME="SGD_FastVLM_full_cls_r${LORA_R}_bs${BATCH_SIZE}"
-USE_FULLSET=true
+USE_FULLSET=false
 
 echo "========================================================="
 echo "Starting Training"

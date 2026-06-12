@@ -1,5 +1,11 @@
 # VLMEmbed
 
+When running in server with no python3.11 installed, follow:
+```bash
+uv python install 3.11
+alias python="$(uv python find 3.11)"
+```
+
 ## Set up env
 
 (Use python3.11 for proper running)
