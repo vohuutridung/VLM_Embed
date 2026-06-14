@@ -635,27 +635,41 @@ class SGDLoss(nn.Module):
         return loss_v, loss_t, loss_cross, valid_v, valid_t, valid_cross
 
 
+    @staticmethod
+    def _num_vision_tokens(image_features, batch_idx):
+        if image_features is None or batch_idx >= len(image_features):
+            return 0
+        feats = image_features[batch_idx]
+        return feats.size(0) if feats is not None else 0
+
+    @staticmethod
+    def _build_text_token_mask(seq_len, num_text, num_vision, is_teacher, device):
+        """Build a mask aligned with hidden/attention sequence length (post vision merge)."""
+        mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
+        num_text = int(num_text)
+        num_vision = int(num_vision)
+        if num_text <= 0:
+            return mask
+        if is_teacher:
+            text_start = max(0, seq_len - num_text)
+        else:
+            text_start = min(num_vision, seq_len)
+        text_end = min(text_start + num_text, seq_len)
+        mask[text_start:text_end] = True
+        return mask
+
     def _compute_batch_level_loss(self, input_data, 
                                  teacher_qry_attention, teacher_pos_attention,
                                  student_qry_attention, student_pos_attention,
                                  teacher_qry_hidden_states, teacher_pos_hidden_states,
-                                 student_qry_hidden_states, student_pos_hidden_states):
+                                 student_qry_hidden_states, student_pos_hidden_states,
+                                 num_text_qry_tokens, num_text_pos_tokens,
+                                 student_qry_image_features, student_pos_image_features,
+                                 teacher_qry_image_features, teacher_pos_image_features):
         # tính batch-level loss trên 1 batch
         device = input_data['student_inputs']['qry']['input_ids'].device
         batch_size = input_data['student_inputs']['qry']['input_ids'].size(0)
         cka_fn_loss = CKALoss(eps=1e-8).to(device)
-
-        BOS_TOKEN_ID = 151643
-        
-        teacher_qry_input_ids = input_data['teacher_inputs']['qry']['input_ids']
-        teacher_pos_input_ids = input_data['teacher_inputs']['pos']['input_ids']
-        student_qry_input_ids = input_data['student_inputs']['qry']['input_ids']
-        student_pos_input_ids = input_data['student_inputs']['pos']['input_ids']
-
-        teacher_qry_attn_mask = input_data['teacher_inputs']['qry'].get('attention_mask', torch.ones_like(teacher_qry_input_ids))
-        teacher_pos_attn_mask = input_data['teacher_inputs']['pos'].get('attention_mask', torch.ones_like(teacher_pos_input_ids))
-        student_qry_attn_mask = input_data['student_inputs']['qry'].get('attention_mask', torch.ones_like(student_qry_input_ids))
-        student_pos_attn_mask = input_data['student_inputs']['pos'].get('attention_mask', torch.ones_like(student_pos_input_ids))
 
         t_qry_atten = teacher_qry_attention[-1].mean(dim=1)
         t_pos_atten = teacher_pos_attention[-1].mean(dim=1)
@@ -676,15 +690,34 @@ class SGDLoss(nn.Module):
         s_qry_reps, s_pos_reps = [], []
 
         for i in range(batch_size):
-            t_qry_ids = teacher_qry_input_ids[i]
-            t_pos_ids = teacher_pos_input_ids[i]
-            s_qry_ids = student_qry_input_ids[i]
-            s_pos_ids = student_pos_input_ids[i]
-
-            t_qry_mask = (teacher_qry_attn_mask[i].bool()) & (t_qry_ids != BOS_TOKEN_ID)
-            t_pos_mask = (teacher_pos_attn_mask[i].bool()) & (t_pos_ids != BOS_TOKEN_ID)
-            s_qry_mask = (student_qry_attn_mask[i].bool()) & (s_qry_ids != BOS_TOKEN_ID)
-            s_pos_mask = (student_pos_attn_mask[i].bool()) & (s_pos_ids != BOS_TOKEN_ID)
+            t_qry_mask = self._build_text_token_mask(
+                t_qry_hidden[i].size(0),
+                num_text_qry_tokens[i].item(),
+                self._num_vision_tokens(teacher_qry_image_features, i),
+                is_teacher=True,
+                device=device,
+            )
+            t_pos_mask = self._build_text_token_mask(
+                t_pos_hidden[i].size(0),
+                num_text_pos_tokens[i].item(),
+                self._num_vision_tokens(teacher_pos_image_features, i),
+                is_teacher=True,
+                device=device,
+            )
+            s_qry_mask = self._build_text_token_mask(
+                s_qry_hidden[i].size(0),
+                num_text_qry_tokens[i].item(),
+                self._num_vision_tokens(student_qry_image_features, i),
+                is_teacher=False,
+                device=device,
+            )
+            s_pos_mask = self._build_text_token_mask(
+                s_pos_hidden[i].size(0),
+                num_text_pos_tokens[i].item(),
+                self._num_vision_tokens(student_pos_image_features, i),
+                is_teacher=False,
+                device=device,
+            )
 
             t_qry_w = t_qry_importance[i] * t_qry_mask.float()
             t_pos_w = t_pos_importance[i] * t_pos_mask.float()
@@ -856,7 +889,10 @@ class SGDLoss(nn.Module):
             teacher_qry_attention, teacher_pos_attention,
             student_qry_attention, student_pos_attention,
             teacher_qry_hidden_states, teacher_pos_hidden_states,
-            student_qry_hidden_states, student_pos_hidden_states
+            student_qry_hidden_states, student_pos_hidden_states,
+            num_text_qry_tokens, num_text_pos_tokens,
+            student_qry_image_features, student_pos_image_features,
+            teacher_qry_image_features, teacher_pos_image_features,
         )
 
         total_loss = (

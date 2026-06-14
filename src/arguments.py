@@ -124,7 +124,7 @@ class TrainingArguments(TrainingArguments):
     #! new args for sgd loss
     kd_weight: float = field(default=1.0, metadata={"help": "weight of kd loss in total loss"})
     min_samples_dbscan_teacher: int = field(default=2, metadata={"help": "min_samples for DBSCAN when clustering teacher features for span loss"})
-    topk_text_ratio: float = field(default=0.3, metadata={"help": "ratio of top-k text tokens selected by attention"})
+    topk_text_ratio: float = field(default=0.8, metadata={"help": "ratio of top-k text tokens selected by attention"})
     knn_neighbors: int = field(default=10, metadata={"help": "number of neighbors for kNN graph construction"})
     num_eigenvectors: int = field(default=16, metadata={"help": "number of eigenvectors for Laplacian Eigenmaps (excluding v_0)"})
     laplacian_type: str = field(default="unnormalized", metadata={"help": "type of Laplacian: unnormalized or normalized"})
