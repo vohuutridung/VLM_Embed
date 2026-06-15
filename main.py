@@ -40,7 +40,7 @@ def is_sgd_loss(training_args: TrainingArguments) -> bool:
     return training_args.kd_loss_type == "sgd_loss"
 
 
-# Preferred display order for tqdm / log lines (subset names without train/ prefix).
+# Full metric keys for logger / wandb (subset names without train/ prefix).
 KD_LOSS_METRIC_KEYS: Dict[str, Tuple[str, ...]] = {
     "sgd_loss": (
         "loss",
@@ -102,6 +102,39 @@ KD_LOSS_METRIC_KEYS: Dict[str, Tuple[str, ...]] = {
 }
 
 
+def use_wandb(training_args: TrainingArguments) -> bool:
+    if not is_main_process():
+        return False
+    report_to = training_args.report_to
+    if report_to is None:
+        return False
+    if isinstance(report_to, str):
+        return report_to == "wandb" or "wandb" in report_to
+    return "wandb" in report_to
+
+
+def init_wandb(
+    training_args: TrainingArguments,
+    model_args: ModelArguments,
+    data_args: DataArguments,
+) -> None:
+    """Initialize W&B (cloud only, no terminal output)."""
+    api_key = training_args.wandb_api_key or os.getenv("WANDB_API_KEY")
+    if api_key:
+        wandb.login(key=api_key, relogin=True)
+    wandb.init(
+        project=os.getenv("WANDB_PROJECT", "vlm_distillation"),
+        name=training_args.run_name or f"run-{int(time.time())}",
+        config={
+            "model_args": vars(model_args),
+            "data_args": vars(data_args),
+            "training_args": vars(training_args),
+        },
+        settings=wandb.Settings(console="off"),
+    )
+    logger.info("W&B initialized (metrics only; console output disabled).")
+
+
 def configure_student_params(distiller: Distiller, training_args: TrainingArguments) -> None:
     """Enable mm_projector, disable lm_head, cast trainable params to bf16."""
     for n, p in distiller.student.named_parameters():
@@ -142,6 +175,7 @@ def build_lr_scheduler(optimizer, training_args: TrainingArguments, max_train_st
 
 
 def collect_train_metrics(outputs: dict, lr_scheduler, epoch: float) -> dict:
+    """Collect training metrics from outputs."""
     metrics = {
         "train/loss": outputs["loss"].item(),
         "train/lr": lr_scheduler.get_last_lr()[0],
@@ -153,54 +187,46 @@ def collect_train_metrics(outputs: dict, lr_scheduler, epoch: float) -> dict:
     return metrics
 
 
-def _metric_display_keys(metrics: dict, kd_loss_type: str) -> Tuple[str, ...]:
-    if kd_loss_type in KD_LOSS_METRIC_KEYS:
-        return KD_LOSS_METRIC_KEYS[kd_loss_type]
-    dynamic = tuple(
-        k.replace("train/", "")
-        for k in sorted(metrics)
-        if k.startswith("train/") and k not in ("train/lr", "train/epoch")
-    )
-    if "loss" in dynamic:
-        return ("loss",) + tuple(k for k in dynamic if k != "loss")
-    return dynamic
+def format_tqdm_postfix(outputs: dict, lr_scheduler) -> dict:
+    """Basic realtime fields for tqdm: total loss and learning rate only."""
+    return {
+        "loss": f"{outputs['loss'].item():.4f}",
+        "lr": f"{lr_scheduler.get_last_lr()[0]:.2e}",
+    }
 
 
-def format_tqdm_postfix(metrics: dict, kd_loss_type: str) -> dict:
-    postfix = {}
-    for key in _metric_display_keys(metrics, kd_loss_type):
-        full_key = f"train/{key}"
-        if full_key not in metrics:
-            continue
-        value = metrics[full_key]
-        if key == "lr":
-            postfix[key] = f"{value:.2e}"
-        else:
-            postfix[key] = f"{value:.4f}"
+def format_detailed_metrics_log(
+    global_step: int, metrics: dict, kd_loss_type: str = ""
+) -> str:
+    """Full loss breakdown for logger (printed every logging_steps)."""
+    meta_parts = [f"step={global_step}"]
+    if "train/epoch" in metrics:
+        meta_parts.append(f"epoch={metrics['train/epoch']:.4f}")
     if "train/lr" in metrics:
-        postfix["lr"] = f"{metrics['train/lr']:.2e}"
-    return postfix
+        meta_parts.append(f"lr={metrics['train/lr']:.2e}")
 
+    loss_parts = []
+    ordered_keys = []
+    if kd_loss_type in KD_LOSS_METRIC_KEYS:
+        for short in KD_LOSS_METRIC_KEYS[kd_loss_type]:
+            full = f"train/{short}"
+            if full in metrics:
+                ordered_keys.append(full)
+    for key in sorted(metrics.keys()):
+        if key.startswith("train/") and key not in ordered_keys:
+            if key.replace("train/", "") in ("lr", "epoch"):
+                continue
+            ordered_keys.append(key)
 
-def format_metrics_log_line(global_step: int, metrics: dict) -> str:
-    parts = [f"step={global_step}"]
-    for key in sorted(metrics):
+    for key in ordered_keys:
         short = key.replace("train/", "")
         value = metrics[key]
-        if short == "lr":
-            parts.append(f"{short}={value:.2e}")
-        elif isinstance(value, float):
-            parts.append(f"{short}={value:.4f}")
+        if isinstance(value, float):
+            loss_parts.append(f"{short}={value:.4f}")
         else:
-            parts.append(f"{short}={value}")
-    return " | ".join(parts)
+            loss_parts.append(f"{short}={value}")
 
-
-def append_metrics_jsonl(metrics_path: str, global_step: int, metrics: dict, prefix: str = "train") -> None:
-    record = {"step": global_step}
-    record.update({k.replace(f"{prefix}/", ""): v for k, v in metrics.items()})
-    with open(metrics_path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record) + "\n")
+    return " | ".join(meta_parts) + " || " + " | ".join(loss_parts)
 
 
 def collect_eval_metrics(outputs: dict) -> Dict[str, float]:
@@ -223,36 +249,45 @@ def format_eval_log_line(global_step: int, epoch: float, metrics: dict) -> str:
     return "eval | " + " | ".join(parts)
 
 
-def setup_file_logging(output_dir: str) -> Optional[str]:
-    if not is_main_process():
-        return None
-    os.makedirs(output_dir, exist_ok=True)
-    log_path = os.path.join(output_dir, "train.log")
-    file_handler = logging.FileHandler(log_path)
-    file_handler.setFormatter(
-        logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s")
-    )
-    logger.addHandler(file_handler)
+def setup_logging(training_args: TrainingArguments, output_dir: str) -> Optional[str]:
+    """Configure root logging: terminal (rank 0) + train.log file."""
+    log_level = logging.INFO
+    log_format = "%(asctime)s - %(levelname)s - %(name)s - %(message)s"
+    datefmt = "%m/%d/%Y %H:%M:%S"
+    formatter = logging.Formatter(log_format, datefmt=datefmt)
+
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.setLevel(log_level)
+
+    log_path = None
+    if is_main_process():
+        stream_handler = logging.StreamHandler(sys.stdout)
+        stream_handler.setFormatter(formatter)
+        stream_handler.setLevel(log_level)
+        root.addHandler(stream_handler)
+
+        os.makedirs(output_dir, exist_ok=True)
+        log_path = os.path.join(output_dir, "train.log")
+        file_handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        file_handler.setLevel(log_level)
+        root.addHandler(file_handler)
+    else:
+        stream_handler = logging.StreamHandler(sys.stderr)
+        stream_handler.setFormatter(formatter)
+        stream_handler.setLevel(logging.ERROR)
+        root.addHandler(stream_handler)
+
+    logger.setLevel(log_level)
+
+    import transformers
+    transformers.utils.logging.set_verbosity_warning()
+    transformers.utils.logging.disable_default_handler()
+    transformers.utils.logging.enable_explicit_format()
+
     return log_path
 
-# ... [Keep setup_logging, ddp_setup, cleanup_ddp, is_main_process, to_device, download_artifacts unchanged] ...
-def setup_logging(training_args: TrainingArguments) -> None:
-    """Configures logging for the training process."""
-    log_level = logging.INFO
-    logging.basicConfig(
-        format=f"[Rank {training_args.local_rank}] %(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        level=log_level,
-        handlers=[logging.StreamHandler(sys.stdout)],
-    )
-    logger.setLevel(log_level)
-    import transformers
-    if training_args.local_rank in [-1, 0]:
-        transformers.utils.logging.set_verbosity_info()
-    else:
-        transformers.utils.logging.set_verbosity_error()
-    transformers.utils.logging.enable_default_handler()
-    transformers.utils.logging.enable_explicit_format()
 
 def ddp_setup() -> None:
     if not dist.is_initialized() and "LOCAL_RANK" in os.environ:
@@ -371,7 +406,13 @@ def evaluate(
     num_batches = 0
 
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Validating", disable=not is_main_process()):
+        for batch in tqdm(
+            dataloader,
+            desc="Validating",
+            disable=not is_main_process(),
+            mininterval=1.0,
+            leave=False,
+        ):
             batch = to_device(batch, device)
             outputs = model(criterion, batch)
             if not isinstance(outputs, dict):
@@ -406,7 +447,7 @@ def run_validation(
     training_args: TrainingArguments,
     best_val_loss: float,
     model_args: ModelArguments,
-    eval_metrics_jsonl_path: Optional[str],
+    use_wandb_logging: bool,
 ) -> float:
     """Run validation, log metrics, and save best checkpoint if improved."""
     eval_metrics = evaluate(distiller, eval_dataloader, criterion, device)
@@ -414,13 +455,8 @@ def run_validation(
 
     if is_main_process():
         logger.info(format_eval_log_line(global_step, epoch, eval_metrics))
-        if "wandb" in training_args.report_to:
+        if use_wandb_logging:
             wandb.log(eval_metrics, step=global_step)
-        if eval_metrics_jsonl_path:
-            record = {"step": global_step, "epoch": epoch}
-            record.update({k.replace("eval/", ""): v for k, v in eval_metrics.items()})
-            with open(eval_metrics_jsonl_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(record) + "\n")
 
         if val_loss < best_val_loss:
             logger.info(
@@ -456,34 +492,16 @@ def main():
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
-    setup_logging(training_args)
+    setup_logging(training_args, training_args.output_dir or ".")
     use_sgd_loss = is_sgd_loss(training_args)
-    train_log_path = setup_file_logging(training_args.output_dir)
-    metrics_jsonl_path = (
-        os.path.join(training_args.output_dir, "metrics.jsonl")
-        if is_main_process()
-        else None
-    )
-    eval_metrics_jsonl_path = (
-        os.path.join(training_args.output_dir, "eval_metrics.jsonl")
-        if is_main_process()
-        else None
-    )
-    if train_log_path:
-        logger.info(f"File logging enabled: {train_log_path}")
-    if metrics_jsonl_path or eval_metrics_jsonl_path:
-        os.makedirs(training_args.output_dir, exist_ok=True)
+    wandb_enabled = use_wandb(training_args)
 
-    if is_main_process() and "wandb" in training_args.report_to: # Initialize WandB for logging
-        wandb.init(
-            project=os.getenv("WANDB_PROJECT", "vlm_distillation"),
-            name=training_args.run_name or f"run-{int(time.time())}",
-            config={
-                "model_args": vars(model_args),
-                "data_args": vars(data_args),
-                "training_args": vars(training_args),
-            }
-        )
+    if wandb_enabled:
+        init_wandb(training_args, model_args, data_args)
+
+    train_log_path = os.path.join(training_args.output_dir or ".", "train.log")
+    if is_main_process():
+        logger.info(f"Logging to terminal and {train_log_path}")
 
     # Artifact Sync
     logger.info("Handling artifact downloading...") # Download artifacts from Hugging Face
@@ -494,7 +512,7 @@ def main():
     else:
         download_artifacts(model_args)
 
-    # --- CHANGED: Dataset Splitting Logic ---
+    # --- Dataset Splitting Logic ---
     logger.info("Preparing dataset...")
     full_dataset = DistillationDataset(data_args, model_args) # Load dataset
     
@@ -613,10 +631,7 @@ def main():
         logger.info(f"  Val split ratio = {data_args.val_split_ratio}")
         logger.info(f"  Eval step = {training_args.eval_steps}")
         logger.info(f"  Output dir = {training_args.output_dir}")
-        if metrics_jsonl_path:
-            logger.info(f"  Train metrics log = {metrics_jsonl_path}")
-        if eval_metrics_jsonl_path:
-            logger.info(f"  Eval metrics log = {eval_metrics_jsonl_path}")
+        logger.info(f"  W&B enabled = {wandb_enabled}")
 
     global_step = 0
     best_val_loss = float('inf') # Track best loss
@@ -627,7 +642,12 @@ def main():
             train_dataloader.sampler.set_epoch(epoch)
         
         distiller.train()
-        epoch_iterator = tqdm(train_dataloader, desc=f"Epoch {epoch+1}", disable=not is_main_process())
+        epoch_iterator = tqdm(
+            train_dataloader,
+            desc=f"Epoch {epoch + 1}",
+            disable=not is_main_process(),
+            mininterval=1.0,
+        )
         
         for step, batch in enumerate(epoch_iterator):
             batch = to_device(batch, device)
@@ -649,22 +669,24 @@ def main():
                 optimizer.zero_grad()
                 global_step += 1
 
-                # Logging
+                if is_main_process():
+                    epoch_iterator.set_postfix(
+                        **format_tqdm_postfix(outputs, lr_scheduler),
+                        refresh=False,
+                    )
+
                 if is_main_process() and global_step % training_args.logging_steps == 0:
                     metrics = collect_train_metrics(
                         outputs,
                         lr_scheduler,
                         epoch + (step + 1) / len(train_dataloader),
                     )
-
-                    if "wandb" in training_args.report_to:
-                        wandb.log(metrics, step=global_step)
-                    logger.info(format_metrics_log_line(global_step, metrics))
-                    if metrics_jsonl_path:
-                        append_metrics_jsonl(metrics_jsonl_path, global_step, metrics)
-                    epoch_iterator.set_postfix(
-                        **format_tqdm_postfix(metrics, training_args.kd_loss_type)
+                    detail_line = format_detailed_metrics_log(
+                        global_step, metrics, training_args.kd_loss_type
                     )
+                    logger.info(detail_line)
+                    if wandb_enabled:
+                        wandb.log(metrics, step=global_step)
 
                 # Periodic validation
                 eval_steps = training_args.eval_steps or 0
@@ -683,7 +705,7 @@ def main():
                         training_args,
                         best_val_loss,
                         model_args,
-                        eval_metrics_jsonl_path,
+                        wandb_enabled,
                     )
                     last_eval_step = global_step
 
@@ -700,7 +722,7 @@ def main():
                 training_args,
                 best_val_loss,
                 model_args,
-                eval_metrics_jsonl_path,
+                wandb_enabled,
             )
 
         # End of epoch Saving
@@ -711,12 +733,17 @@ def main():
         if dist.is_initialized():
             dist.barrier()
 
-    logger.info("Training completed.")
-    if is_main_process() and eval_dataloader is not None:
-        if best_val_loss < float("inf"):
-            logger.info(f"Best validation loss: {best_val_loss:.4f} (checkpoint-best)")
-        else:
-            logger.info("Validation was run but no improvement over initial best loss.")
+    if is_main_process():
+        logger.info("Training completed.")
+        if eval_dataloader is not None:
+            if best_val_loss < float("inf"):
+                logger.info(f"Best validation loss: {best_val_loss:.4f} (checkpoint-best)")
+            else:
+                logger.info("Validation was run but no improvement over initial best loss.")
+        logger.info(f"Full log saved to {train_log_path}")
+        for handler in logging.getLogger().handlers:
+            if isinstance(handler, logging.FileHandler):
+                handler.flush()
 
     # Final Save
     save_checkpoint(training_args.output_dir, int(training_args.num_train_epochs), distiller, model_args, folder_name="checkpoint-final")
@@ -724,7 +751,7 @@ def main():
         dist.barrier()  # <--- Crucial: Wait for Rank 0 to finish saving!
     # =========================================================================
     
-    if is_main_process() and "wandb" in training_args.report_to:
+    if wandb_enabled:
         wandb.finish()
 
     cleanup_ddp()

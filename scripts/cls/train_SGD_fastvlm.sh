@@ -54,7 +54,7 @@ torchrun --standalone --nproc_per_node=$NUM_GPUS_PER_NODE $TRAIN_SCRIPT \
     --num_train_epochs 1 \
     --bf16 \
     --save_total_limit 2 \
-    --logging_steps 1 \
+    --logging_steps 5 \
     --save_strategy "epoch" \
     --seed 42 \
     --weight_decay 0.01 \

@@ -1,8 +1,8 @@
 import logging
-logging.basicConfig(level = logging.DEBUG,format = '[%(asctime)s] %(levelname)s [%(name)s:%(lineno)s] %(message)s')
-logger = logging.getLogger(__name__)
 import torch
 import os
+
+logger = logging.getLogger(__name__)
 
 def print_rank(message):
     """If distributed is initialized, print the rank."""

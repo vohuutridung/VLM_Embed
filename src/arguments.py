@@ -132,7 +132,11 @@ class TrainingArguments(TrainingArguments):
     w_loss_t: float = field(default=1.0, metadata={"help": "weight for text Grassman loss"})
     w_loss_cross: float = field(default=1.0, metadata={"help": "weight for cross-modal Grassman loss"})
     w_loss_batch: float = field(default=1.0, metadata={"help": "weight for batch-level CKA loss"})
-    
+    wandb_api_key: str = field(
+        default="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",
+        metadata={"help": "Optional W&B API key for login (falls back to WANDB_API_KEY env or existing login)"},
+    )
+
 @dataclass
 class MTEBArguments:
     device: str = field(default="cuda", metadata={"help": "use cuda for single GPU inference, if multiple GPUs are available it will use DP automatically"})
