@@ -10,7 +10,6 @@ KD_WEIGHT=1.0
 W_LOSS_V=1.0
 W_LOSS_T=1.0
 W_LOSS_CROSS=1.0
-W_LOSS_BATCH=1.0
 
 # Configs
 TRAIN_SCRIPT="main.py"
@@ -67,7 +66,6 @@ torchrun --standalone --nproc_per_node=$NUM_GPUS_PER_NODE $TRAIN_SCRIPT \
     --w_loss_v $W_LOSS_V \
     --w_loss_t $W_LOSS_T \
     --w_loss_cross $W_LOSS_CROSS \
-    --w_loss_batch $W_LOSS_BATCH \
     --image_resolution "low" \
     --report_to "wandb" \
     --run_name "$EXP_NAME"
