@@ -11,6 +11,14 @@ W_LOSS_V=1.0
 W_LOSS_T=1.0
 W_LOSS_CROSS=1.0
 
+# Spectral loss (unified batch-level Grassman KD)
+GRASSMAN_VISION_USE_CLUSTER=True
+GRASSMAN_TEXT_USE_TOPK=True
+TOPK_TEXT_RATIO=0.8
+KNN_NEIGHBORS=10
+NUM_EIGENVECTORS=16
+LAPLACIAN_TYPE="unnormalized"
+
 # Configs
 TRAIN_SCRIPT="main.py"
 EXP_NAME="SGD_FastVLM_full_cls_r${LORA_R}_bs${BATCH_SIZE}"
@@ -66,6 +74,12 @@ torchrun --standalone --nproc_per_node=$NUM_GPUS_PER_NODE $TRAIN_SCRIPT \
     --w_loss_v $W_LOSS_V \
     --w_loss_t $W_LOSS_T \
     --w_loss_cross $W_LOSS_CROSS \
+    --grassman_vision_use_cluster $GRASSMAN_VISION_USE_CLUSTER \
+    --grassman_text_use_topk $GRASSMAN_TEXT_USE_TOPK \
+    --topk_text_ratio $TOPK_TEXT_RATIO \
+    --knn_neighbors $KNN_NEIGHBORS \
+    --num_eigenvectors $NUM_EIGENVECTORS \
+    --laplacian_type "$LAPLACIAN_TYPE" \
     --image_resolution "low" \
     --report_to "wandb" \
     --run_name "$EXP_NAME"
