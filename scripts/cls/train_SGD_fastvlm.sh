@@ -2,9 +2,9 @@
 
 # GPU per node
 NUM_GPUS_PER_NODE=1
-LORA_R=64
+LORA_R=32
 LORA_A=64
-BATCH_SIZE=16
+BATCH_SIZE=8
 
 KD_WEIGHT=1.0
 W_LOSS_V=1.0
@@ -46,7 +46,7 @@ torchrun --standalone --nproc_per_node=$NUM_GPUS_PER_NODE $TRAIN_SCRIPT \
     --subset_name "${SUBSETS[@]}" \
     --dataset_split "original" \
     --image_dir "vlm2vec_train/MMEB-train" \
-    --percent_data 0.5 \
+    --percent_data 0.05 \
     --output_dir "training/$EXP_NAME" \
     --per_device_train_batch_size $BATCH_SIZE \
     --gradient_accumulation_steps 1 \

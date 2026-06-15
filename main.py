@@ -33,6 +33,13 @@ from transformers import (
 from src.distiller import Distiller, DistillationCollator, DistillationDataset
 from src.arguments import DataArguments, ModelArguments, TrainingArguments
 from src.criterions import build_criterion
+from src.nan_debug import (
+    TrainNanDebugger,
+    configure_nan_debug_logging,
+    get_nan_debug_dir,
+    log_training_output_dirs,
+    loss_is_finite,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -492,16 +499,17 @@ def main():
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
-    setup_logging(training_args, training_args.output_dir or ".")
+    output_dir = training_args.output_dir or "."
+    setup_logging(training_args, output_dir)
+    nan_debug_dir = configure_nan_debug_logging(output_dir)
     use_sgd_loss = is_sgd_loss(training_args)
     wandb_enabled = use_wandb(training_args)
 
     if wandb_enabled:
         init_wandb(training_args, model_args, data_args)
 
-    train_log_path = os.path.join(training_args.output_dir or ".", "train.log")
-    if is_main_process():
-        logger.info(f"Logging to terminal and {train_log_path}")
+    train_log_path = os.path.join(output_dir, "train.log")
+    log_training_output_dirs(train_log_path, nan_debug_dir)
 
     # Artifact Sync
     logger.info("Handling artifact downloading...") # Download artifacts from Hugging Face
@@ -618,6 +626,7 @@ def main():
     lr_scheduler = build_lr_scheduler(optimizer, training_args, max_train_steps)
 
     criterion = build_criterion(training_args).to(device)
+    nan_debugger = TrainNanDebugger(distiller)
 
     # Training Stats
     if is_main_process():
@@ -651,20 +660,29 @@ def main():
         
         for step, batch in enumerate(epoch_iterator):
             batch = to_device(batch, device)
-            
+            step_num = global_step + 1
+            epoch_step = step + 1
+            nan_debugger.annotate_step(training_args, step_num, epoch_step)
+
             outputs = distiller(criterion, batch)
             loss = outputs["loss"] / training_args.gradient_accumulation_steps
+            finite_loss = loss_is_finite(loss)
+
+            if not finite_loss:
+                nan_debugger.before_backward(step_num, epoch_step, outputs)
             loss.backward()
+            if not finite_loss:
+                nan_debugger.after_backward(step_num, epoch_step, outputs)
 
             if (step + 1) % training_args.gradient_accumulation_steps == 0:
                 if training_args.max_grad_norm is not None and training_args.max_grad_norm > 0:
-                    model_for_clip = distiller.module if hasattr(distiller, "module") else distiller
-                    torch.nn.utils.clip_grad_norm_(
-                        model_for_clip.student.parameters(),
-                        training_args.max_grad_norm,
+                    nan_debugger.clip_gradients(
+                        step_num, epoch_step, outputs, training_args.max_grad_norm
                     )
 
                 optimizer.step()
+                if not finite_loss:
+                    nan_debugger.after_optimizer_step(step_num, epoch_step, outputs)
                 lr_scheduler.step()
                 optimizer.zero_grad()
                 global_step += 1
@@ -741,6 +759,9 @@ def main():
             else:
                 logger.info("Validation was run but no improvement over initial best loss.")
         logger.info(f"Full log saved to {train_log_path}")
+        nan_debug_dir = get_nan_debug_dir()
+        if nan_debug_dir:
+            logger.info(f"NaN debug logs saved to {nan_debug_dir}/")
         for handler in logging.getLogger().handlers:
             if isinstance(handler, logging.FileHandler):
                 handler.flush()

@@ -1,9 +1,18 @@
+import logging
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 import numpy as np
 from sklearn.cluster import DBSCAN
+
+from src.nan_debug import (
+    log_sgd_forward_debug,
+    summarize_weight_graph,
+)
+
+logger = logging.getLogger(__name__)
 
 
 # ====== Vision Clustering Functions ======
@@ -122,6 +131,37 @@ def map_teacher_clusters_to_student(cluster_labels,
         student_cluster_mapping[cluster_id] = list(student_cluster_mapping[cluster_id])
         
     return student_cluster_mapping, student_token_to_cluster
+
+
+def map_teacher_tokens_to_student(
+    num_teacher_tokens,
+    teacher_num_patches_per_row,
+    teacher_patch_size,
+    student_num_patches_per_row,
+    student_patch_size,
+    original_width,
+    original_height,
+    num_student_tokens,
+    student_resize=1024,
+):
+    """Map each teacher vision token to a spatially corresponding student token index."""
+    student_indices = []
+    for teacher_idx in range(num_teacher_tokens):
+        teacher_x, teacher_y = get_patch_coordinates(
+            teacher_idx, teacher_num_patches_per_row, teacher_patch_size
+        )
+        scale_x = student_resize / original_width
+        scale_y = student_resize / original_height
+        student_x = teacher_x * scale_x
+        student_y = teacher_y * scale_y
+        student_col = int(student_x // student_patch_size)
+        student_row = int(student_y // student_patch_size)
+        student_col = min(max(student_col, 0), student_num_patches_per_row - 1)
+        student_row = min(max(student_row, 0), student_num_patches_per_row - 1)
+        student_idx = student_row * student_num_patches_per_row + student_col
+        student_idx = min(max(student_idx, 0), num_student_tokens - 1)
+        student_indices.append(student_idx)
+    return student_indices
 
 
 def prepare_vision_cluster_info(cluster_labels, device):
@@ -512,6 +552,8 @@ class SGDLoss(nn.Module):
         self.teacher_patch_size = getattr(args, 'teacher_patch_size', 28)
         self.student_patch_size = getattr(args, 'student_patch_size', 64)
         self.student_resize = getattr(args, 'student_resize', 1024)
+        self.grassman_vision_use_cluster = getattr(args, 'grassman_vision_use_cluster', True)
+        self.grassman_text_use_topk = getattr(args, 'grassman_text_use_topk', True)
         self.topk_text_ratio = getattr(args, 'topk_text_ratio', 0.3)
         self.knn_neighbors = getattr(args, 'knn_neighbors', 10)
         self.num_eigenvectors = getattr(args, 'num_eigenvectors', 16)
@@ -533,7 +575,8 @@ class SGDLoss(nn.Module):
 
     def _compute_sample_grassman_loss(self, s_text_hidden, t_text_hidden,
                                       s_vision_hidden, t_vision_hidden,
-                                      num_text, has_image, original_width, original_height):
+                                      num_text, has_image, original_width, original_height,
+                                      batch_idx=0, side="qry"):
         """Tính loss Grassman cho một sample trong batch"""
         device = (
             s_text_hidden.device if s_text_hidden is not None
@@ -548,91 +591,246 @@ class SGDLoss(nn.Module):
         valid_v = valid_t = valid_cross = 0
         h_t_v = h_s_v = h_t_t = h_s_t = None # hidden states cho vision tokens, text tokens của teacher và student
 
+        debug = {
+            "batch_idx": batch_idx,
+            "side": side,
+            "has_image": bool(has_image),
+            "num_text": int(num_text),
+            "vision": {},
+            "text": {},
+            "cross": {},
+            "losses": {"v": 0.0, "t": 0.0, "cross": 0.0},
+        }
+        vision_dbg = debug["vision"]
+        text_dbg = debug["text"]
+        cross_dbg = debug["cross"]
+
         # ===== Vision tokens =====
         if has_image and t_vision_hidden is not None and s_vision_hidden is not None:
             num_teacher_tokens = t_vision_hidden.size(0)
-            if num_teacher_tokens > 0:
-                teacher_patches_per_row = int(np.sqrt(num_teacher_tokens))
-                cluster_labels = cluster_vision_tokens_hdbscan(
-                    t_vision_hidden,
-                    teacher_patches_per_row, self.teacher_patch_size,
-                    original_width, original_height,
-                    min_cluster_size=6,
-                    min_samples_dbscan=max(1, int(getattr(self.args, 'min_samples_dbscan_teacher', 8))),
-                )
-                cluster_info = prepare_vision_cluster_info(cluster_labels, device)
-                # cluster_info gồm token_indices, cluster_ids, num_clusters, cluster_mapping, original_labels
+            num_student_tokens = s_vision_hidden.size(0)
+            vision_dbg["teacher_tokens"] = int(num_teacher_tokens)
+            vision_dbg["student_tokens"] = int(num_student_tokens)
+            vision_dbg["use_cluster"] = bool(self.grassman_vision_use_cluster)
 
-                if cluster_info is not None and cluster_info['num_clusters'] >= 2:
-                    t_weights = compute_intra_cluster_attention_weights(t_vision_hidden, cluster_info)
-                    if t_weights is not None:
-                        h_t_v = compute_weighted_cluster_mean(t_vision_hidden, cluster_info, t_weights)
-
-                    student_mapping, _ = map_teacher_clusters_to_student( # map cluster labels từ teacher sang student
-                        cluster_labels,
+            if num_teacher_tokens >= 2:
+                if self.grassman_vision_use_cluster:
+                    teacher_patches_per_row = int(np.sqrt(num_teacher_tokens))
+                    cluster_labels = cluster_vision_tokens_hdbscan(
+                        t_vision_hidden,
                         teacher_patches_per_row, self.teacher_patch_size,
-                        int(np.sqrt(s_vision_hidden.size(0))) if s_vision_hidden.size(0) > 0 else 0,
-                        self.student_patch_size,
                         original_width, original_height,
-                        self.student_resize,
+                        min_cluster_size=6,
+                        min_samples_dbscan=max(1, int(getattr(self.args, 'min_samples_dbscan_teacher', 8))),
+                    )
+                    labels_np = np.array(cluster_labels)
+                    unique_labels = [int(c) for c in np.unique(labels_np) if c >= 0]
+                    vision_dbg["dbscan_clusters"] = len(unique_labels)
+                    vision_dbg["noise_tokens"] = int((labels_np < 0).sum())
+                    vision_dbg["cluster_sizes"] = [
+                        int((labels_np == c).sum()) for c in unique_labels
+                    ]
+
+                    cluster_info = prepare_vision_cluster_info(cluster_labels, device)
+                    vision_dbg["valid_clusters"] = (
+                        int(cluster_info["num_clusters"]) if cluster_info is not None else 0
                     )
 
-                    if student_mapping:
-                        s_token_indices_list, s_cluster_ids_list = [], []
-                        for cluster_id, student_indices in student_mapping.items():
-                            for s_idx in student_indices:
-                                if s_idx < s_vision_hidden.size(0):
-                                    s_token_indices_list.append(s_idx)
-                                    s_cluster_ids_list.append(cluster_id)
+                    if cluster_info is None:
+                        vision_dbg["skip_reason"] = "no_valid_cluster_labels"
+                    elif cluster_info['num_clusters'] < 2:
+                        vision_dbg["skip_reason"] = "valid_clusters_lt_2"
 
-                        if s_token_indices_list:
-                            student_cluster_info = {
-                                'token_indices': torch.tensor(s_token_indices_list, dtype=torch.long, device=device),
-                                'cluster_ids': torch.tensor(s_cluster_ids_list, dtype=torch.long, device=device),
-                                'num_clusters': cluster_info['num_clusters'],
-                            }
-                            s_weights = compute_intra_cluster_attention_weights(s_vision_hidden, student_cluster_info)
-                            if s_weights is not None:
-                                h_s_v = compute_weighted_cluster_mean(s_vision_hidden, student_cluster_info, s_weights)
+                    if cluster_info is not None and cluster_info['num_clusters'] >= 2:
+                        t_weights = compute_intra_cluster_attention_weights(t_vision_hidden, cluster_info)
+                        if t_weights is not None:
+                            h_t_v = compute_weighted_cluster_mean(t_vision_hidden, cluster_info, t_weights)
+                        vision_dbg["teacher_graph_nodes"] = (
+                            int(h_t_v.size(0)) if h_t_v is not None else None
+                        )
+
+                        student_mapping, _ = map_teacher_clusters_to_student(
+                            cluster_labels,
+                            teacher_patches_per_row, self.teacher_patch_size,
+                            int(np.sqrt(num_student_tokens)) if num_student_tokens > 0 else 0,
+                            self.student_patch_size,
+                            original_width, original_height,
+                            self.student_resize,
+                        )
+
+                        mapped_tokens = 0
+                        if student_mapping:
+                            s_token_indices_list, s_cluster_ids_list = [], []
+                            for cluster_id, student_indices in student_mapping.items():
+                                for s_idx in student_indices:
+                                    if s_idx < num_student_tokens:
+                                        s_token_indices_list.append(s_idx)
+                                        s_cluster_ids_list.append(cluster_id)
+                                        mapped_tokens += 1
+                            vision_dbg["mapped_student_tokens"] = mapped_tokens
+
+                            if s_token_indices_list:
+                                student_cluster_info = {
+                                    'token_indices': torch.tensor(s_token_indices_list, dtype=torch.long, device=device),
+                                    'cluster_ids': torch.tensor(s_cluster_ids_list, dtype=torch.long, device=device),
+                                    'num_clusters': cluster_info['num_clusters'],
+                                }
+                                s_weights = compute_intra_cluster_attention_weights(s_vision_hidden, student_cluster_info)
+                                if s_weights is not None:
+                                    h_s_v = compute_weighted_cluster_mean(s_vision_hidden, student_cluster_info, s_weights)
+                            else:
+                                vision_dbg["skip_reason"] = "no_mapped_student_tokens"
+                        else:
+                            vision_dbg["skip_reason"] = "empty_student_cluster_mapping"
+
+                        vision_dbg["student_graph_nodes"] = (
+                            int(h_s_v.size(0)) if h_s_v is not None else None
+                        )
+                else:
+                    teacher_patches_per_row = int(np.sqrt(num_teacher_tokens))
+                    student_patches_per_row = int(np.sqrt(num_student_tokens)) if num_student_tokens > 0 else 0
+                    if student_patches_per_row <= 0:
+                        vision_dbg["skip_reason"] = "zero_student_vision_tokens"
+                    else:
+                        student_indices = map_teacher_tokens_to_student(
+                            num_teacher_tokens,
+                            teacher_patches_per_row,
+                            self.teacher_patch_size,
+                            student_patches_per_row,
+                            self.student_patch_size,
+                            original_width,
+                            original_height,
+                            num_student_tokens,
+                            self.student_resize,
+                        )
+                        student_idx_tensor = torch.tensor(student_indices, dtype=torch.long, device=device)
+                        h_t_v = t_vision_hidden
+                        h_s_v = s_vision_hidden[student_idx_tensor]
+                        vision_dbg["graph_nodes"] = int(h_t_v.size(0))
+                        vision_dbg["teacher_graph_nodes"] = int(h_t_v.size(0))
+                        vision_dbg["student_graph_nodes"] = int(h_s_v.size(0))
 
                 if (h_t_v is not None and h_s_v is not None
                         and h_t_v.size(0) == h_s_v.size(0) and h_t_v.size(0) >= 2):
                     W_t = build_knn_weight_matrix(h_t_v, self.knn_neighbors)
                     W_s = build_knn_weight_matrix(h_s_v, self.knn_neighbors)
+                    vision_dbg["graph_teacher"] = summarize_weight_graph(
+                        W_t,
+                        knn_neighbors=self.knn_neighbors,
+                        num_eigenvectors=self.num_eigenvectors,
+                        laplacian_type=self.laplacian_type,
+                    )
+                    vision_dbg["graph_student"] = summarize_weight_graph(
+                        W_s,
+                        knn_neighbors=self.knn_neighbors,
+                        num_eigenvectors=self.num_eigenvectors,
+                        laplacian_type=self.laplacian_type,
+                    )
                     espace_t = compute_laplacian_eigenspace(W_t, self.num_eigenvectors, self.laplacian_type)
                     espace_s = compute_laplacian_eigenspace(W_s, self.num_eigenvectors, self.laplacian_type)
                     loss_v = compute_grassman_loss(espace_t, espace_s)
                     valid_v = 1
+                    vision_dbg["vision_loss_valid"] = True
+                elif h_t_v is None or h_s_v is None:
+                    if "skip_reason" not in vision_dbg:
+                        vision_dbg["skip_reason"] = "missing_vision_representations"
+                elif h_t_v.size(0) != h_s_v.size(0):
+                    vision_dbg["skip_reason"] = "teacher_student_node_count_mismatch"
+                elif h_t_v.size(0) < 2:
+                    vision_dbg["skip_reason"] = "vision_nodes_lt_2"
+            else:
+                vision_dbg["skip_reason"] = "teacher_vision_tokens_lt_2"
+        elif has_image:
+            vision_dbg["skip_reason"] = "missing_vision_hidden_states"
+
+        vision_dbg["vision_loss_valid"] = bool(valid_v)
 
         # ===== Text tokens =====
         if num_text > 0 and t_text_hidden is not None and s_text_hidden is not None:
-            topk_indices = select_topk_text_tokens_by_last_token_cosine(t_text_hidden, self.topk_text_ratio)
-            h_t_t = t_text_hidden[topk_indices]
-            h_s_t = s_text_hidden[topk_indices]
+            text_dbg["use_topk"] = bool(self.grassman_text_use_topk)
+            if self.grassman_text_use_topk:
+                topk_indices = select_topk_text_tokens_by_last_token_cosine(t_text_hidden, self.topk_text_ratio)
+                h_t_t = t_text_hidden[topk_indices]
+                h_s_t = s_text_hidden[topk_indices]
+                text_dbg["topk_tokens"] = int(h_t_t.size(0))
+            else:
+                h_t_t = t_text_hidden
+                h_s_t = s_text_hidden
+                text_dbg["num_tokens"] = int(h_t_t.size(0))
 
             if h_t_t.size(0) >= 2:
                 W_t = build_knn_weight_matrix(h_t_t, self.knn_neighbors)
                 W_s = build_knn_weight_matrix(h_s_t, self.knn_neighbors)
+                text_dbg["graph_teacher"] = summarize_weight_graph(
+                    W_t,
+                    knn_neighbors=self.knn_neighbors,
+                    num_eigenvectors=self.num_eigenvectors,
+                    laplacian_type=self.laplacian_type,
+                )
+                text_dbg["graph_student"] = summarize_weight_graph(
+                    W_s,
+                    knn_neighbors=self.knn_neighbors,
+                    num_eigenvectors=self.num_eigenvectors,
+                    laplacian_type=self.laplacian_type,
+                )
                 espace_t = compute_laplacian_eigenspace(W_t, self.num_eigenvectors, self.laplacian_type)
                 espace_s = compute_laplacian_eigenspace(W_s, self.num_eigenvectors, self.laplacian_type)
                 loss_t = compute_grassman_loss(espace_t, espace_s)
                 valid_t = 1
+                text_dbg["text_loss_valid"] = True
+            else:
+                text_dbg["skip_reason"] = "text_tokens_lt_2"
+        elif num_text > 0:
+            text_dbg["skip_reason"] = "missing_text_hidden_states"
+        text_dbg["text_loss_valid"] = bool(valid_t)
 
         # ===== Cross-modal tokens =====
+        cross_dbg["vision_nodes"] = int(h_t_v.size(0)) if h_t_v is not None else None
+        cross_dbg["text_nodes"] = int(h_t_t.size(0)) if h_t_t is not None else None
         if (valid_v and valid_t and h_t_v is not None and h_s_v is not None
                 and h_t_t is not None and h_s_t is not None
                 and h_t_v.size(0) == h_s_v.size(0)
                 and h_t_t.size(0) == h_s_t.size(0)):
             n_total = h_t_v.size(0) + h_t_t.size(0)
+            cross_dbg["total_nodes"] = int(n_total)
             if n_total >= 3:
                 W_t_cross = build_bipartite_weight_matrix(h_t_v, h_t_t)
                 W_s_cross = build_bipartite_weight_matrix(h_s_v, h_s_t)
+                cross_dbg["graph_teacher"] = summarize_weight_graph(
+                    W_t_cross,
+                    knn_neighbors=self.knn_neighbors,
+                    num_eigenvectors=self.num_eigenvectors,
+                    laplacian_type=self.laplacian_type,
+                )
+                cross_dbg["graph_student"] = summarize_weight_graph(
+                    W_s_cross,
+                    knn_neighbors=self.knn_neighbors,
+                    num_eigenvectors=self.num_eigenvectors,
+                    laplacian_type=self.laplacian_type,
+                )
                 espace_t = compute_laplacian_eigenspace(W_t_cross, self.num_eigenvectors, self.laplacian_type)
                 espace_s = compute_laplacian_eigenspace(W_s_cross, self.num_eigenvectors, self.laplacian_type)
                 loss_cross = compute_grassman_loss(espace_t, espace_s)
                 valid_cross = 1
+                cross_dbg["cross_loss_valid"] = True
+            else:
+                cross_dbg["skip_reason"] = "total_nodes_lt_3"
+        else:
+            if not valid_v or not valid_t:
+                cross_dbg["skip_reason"] = "vision_or_text_loss_invalid"
+            elif h_t_v is None or h_t_t is None:
+                cross_dbg["skip_reason"] = "missing_modal_representations"
+            else:
+                cross_dbg["skip_reason"] = "vision_text_node_count_mismatch"
+        cross_dbg["cross_loss_valid"] = bool(valid_cross)
 
-        return loss_v, loss_t, loss_cross, valid_v, valid_t, valid_cross
+        debug["losses"] = {
+            "v": float(loss_v.detach().item()) if torch.isfinite(loss_v) else float("nan"),
+            "t": float(loss_t.detach().item()) if torch.isfinite(loss_t) else float("nan"),
+            "cross": float(loss_cross.detach().item()) if torch.isfinite(loss_cross) else float("nan"),
+        }
+
+        return loss_v, loss_t, loss_cross, valid_v, valid_t, valid_cross, debug
 
 
     @staticmethod
@@ -759,14 +957,15 @@ class SGDLoss(nn.Module):
         # tính token-level loss trên 1 batch
         total_loss_v = total_loss_t = total_loss_cross = 0.0
         valid_vision_samples = valid_text_samples = valid_cross_modal_samples = 0
+        grassman_debug = []
 
         for i in range(batch_size):
             # for sample in [query, positive]
-            for side_args in (
-                (num_text_qry_tokens[i].item(), student_qry_image_features, teacher_qry_image_features,
-                 student_qry_hidden_states, teacher_qry_hidden_states, qry_image_sizes),
-                (num_text_pos_tokens[i].item(), student_pos_image_features, teacher_pos_image_features,
-                 student_pos_hidden_states, teacher_pos_hidden_states, pos_image_sizes),
+            for side, side_args in (
+                ("qry", (num_text_qry_tokens[i].item(), student_qry_image_features, teacher_qry_image_features,
+                 student_qry_hidden_states, teacher_qry_hidden_states, qry_image_sizes)),
+                ("pos", (num_text_pos_tokens[i].item(), student_pos_image_features, teacher_pos_image_features,
+                 student_pos_hidden_states, teacher_pos_hidden_states, pos_image_sizes)),
             ):
                 num_text, s_img_feats, t_img_feats, s_hidden, t_hidden, image_sizes = side_args
 
@@ -797,10 +996,13 @@ class SGDLoss(nn.Module):
                         t_hidden, i, num_vision_teacher, num_text, is_teacher=True,
                     )[-1]
 
-                lv, lt, lc, vv, vt, vc = self._compute_sample_grassman_loss(
+                lv, lt, lc, vv, vt, vc, sample_debug = self._compute_sample_grassman_loss(
                     s_text_last, t_text_last, s_vision_last, t_vision_last,
                     num_text, has_image, img_w, img_h,
+                    batch_idx=i,
+                    side=side,
                 )
+                grassman_debug.append(sample_debug)
                 total_loss_v += lv
                 total_loss_t += lt
                 total_loss_cross += lc
@@ -817,7 +1019,13 @@ class SGDLoss(nn.Module):
             + self.w_loss_t * token_level_loss_t
             + self.w_loss_cross * token_level_loss_cross
         )
-        return token_level_loss, token_level_loss_v, token_level_loss_t, token_level_loss_cross
+        return (
+            token_level_loss,
+            token_level_loss_v,
+            token_level_loss_t,
+            token_level_loss_cross,
+            grassman_debug,
+        )
 
     def forward(self, distiller, input_data):
         student_model = distiller.student
@@ -867,13 +1075,17 @@ class SGDLoss(nn.Module):
         contrastive_loss = nn.CrossEntropyLoss()(scores / distiller.temperature, target)
 
         # RKD loss (distance loss + angle loss)
-        rkd_loss = (
-            self.compute_distance_loss(student_qry_reps, student_pos_reps, teacher_qry_reps, teacher_pos_reps)
-            + self.compute_angle_loss(student_qry_reps, student_pos_reps, teacher_qry_reps, teacher_pos_reps)
-        ) / 2.0
+        rkd_distance_loss = self.compute_distance_loss(
+            student_qry_reps, student_pos_reps, teacher_qry_reps, teacher_pos_reps
+        )
+        rkd_angle_loss = self.compute_angle_loss(
+            student_qry_reps, student_pos_reps, teacher_qry_reps, teacher_pos_reps
+        )
+        rkd_loss = (rkd_distance_loss + rkd_angle_loss) / 2.0
 
         # Token-level loss
-        token_level_loss, token_level_loss_v, token_level_loss_t, token_level_loss_cross = self._compute_token_level_loss(
+        token_level_loss, token_level_loss_v, token_level_loss_t, token_level_loss_cross, grassman_debug = (
+            self._compute_token_level_loss(
             batch_size, device,
             num_text_qry_tokens, num_text_pos_tokens,
             student_qry_image_features, teacher_qry_image_features,
@@ -881,7 +1093,7 @@ class SGDLoss(nn.Module):
             student_qry_hidden_states, teacher_qry_hidden_states,
             student_pos_hidden_states, teacher_pos_hidden_states,
             qry_image_sizes, pos_image_sizes
-        )
+        ))
         
         # Batch-level loss
         batch_level_loss = self._compute_batch_level_loss(
@@ -902,7 +1114,7 @@ class SGDLoss(nn.Module):
             + self.kd_weight * self.w_loss_batch * batch_level_loss
         )
 
-        return {
+        loss_dict = {
             'loss': total_loss,
             'contrastive_loss': contrastive_loss,
             'rkd_loss': rkd_loss,
@@ -912,6 +1124,26 @@ class SGDLoss(nn.Module):
             'token_level_loss_t': token_level_loss_t,
             'token_level_loss_cross': token_level_loss_cross,
         }
+        log_sgd_forward_debug(
+            training_args=self.args,
+            loss_dict=loss_dict,
+            grassman_debug=grassman_debug,
+            student_qry_input=student_qry_input,
+            student_pos_input=student_pos_input,
+            student_qry_reps=student_qry_reps,
+            student_pos_reps=student_pos_reps,
+            teacher_qry_reps=teacher_qry_reps,
+            teacher_pos_reps=teacher_pos_reps,
+            student_qry_hidden_states=student_qry_hidden_states,
+            student_pos_hidden_states=student_pos_hidden_states,
+            student_qry_attention=student_qry_attention,
+            student_pos_attention=student_pos_attention,
+            scores=scores,
+            rkd_distance_loss=rkd_distance_loss,
+            rkd_angle_loss=rkd_angle_loss,
+            temperature=distiller.temperature,
+        )
+        return loss_dict
 
     def pairwise_distance(self, x):
         norm = (x**2).sum(dim=1, keepdim=True)
