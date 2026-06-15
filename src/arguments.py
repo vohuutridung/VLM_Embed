@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from transformers import TrainingArguments
-from typing import List
+from typing import List, Optional
 
 
 @dataclass
@@ -78,6 +78,7 @@ class DataArguments:
     pos_only: bool = field(default=False, metadata={"help": "Only use positives"})
     # new args distillation
     percent_data: float = field(default=1.0, metadata={"help": "percentage of data used for distillation training"})
+    val_split_ratio: float = field(default=0.0, metadata={"help": "fraction of training data held out for validation"})
     
 
 
@@ -118,6 +119,12 @@ class TrainingArguments(TrainingArguments):
     )
     w_cross_modal_loss: float = field(default=1.0, metadata={"help": "weight for cross modal loss"})
     min_samples_dbscan_teacher: int = field(default=2, metadata={"help": "min_samples for DBSCAN when clustering teacher features for span loss"})
+    # batch graph eigenspace distillation
+    w_loss_batch: float = field(default=1.0, metadata={"help": "weight for batch-level eigenspace distillation loss"})
+    batch_graph_k: int = field(default=8, metadata={"help": "kNN neighbors for Laplacian eigenmap graph"})
+    batch_graph_num_eigen: int = field(default=16, metadata={"help": "number of eigenvectors for eigenspace projection"})
+    batch_graph_heat_t: Optional[float] = field(default=None, metadata={"help": "heat kernel bandwidth; None = auto from kNN distances"})
+    wandb_api_key: str = field(default=None, metadata={"help": "optional W&B API key"})
 @dataclass
 class MTEBArguments:
     device: str = field(default="cuda", metadata={"help": "use cuda for single GPU inference, if multiple GPUs are available it will use DP automatically"})

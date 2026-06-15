@@ -98,7 +98,7 @@ class Distiller(nn.Module):
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_args.teacher_model_name)
         # if self.model_args.projector_config_path is not None:
         self.set_projector()
-        print("Projectors set.")
+        print_master("Projectors set.")
     
     def _create_model_args(self, model_type='teacher'):
         if model_type == 'teacher': 
@@ -120,31 +120,31 @@ class Distiller(nn.Module):
         return model_args
     
     def _load_student(self):
-        print("Load student with lora rank:", self.model_args.lora_r)
-        print("Student use lora:", self.model_args.lora)
+        print_master(f"Load student with lora rank: {self.model_args.lora_r}")
+        print_master(f"Student use lora: {self.model_args.lora}")
         student = MMEBModel.build(self.model_args)
-        print("Student model built.")
+        print_master("Student model built.")
         return student 
     
     def _load_teacher(self):
         model_args = self._create_model_args('teacher')
-        print("Load teacher with lora rank:", model_args.lora_r)
-        print("Teacher use lora:", model_args.lora)
+        print_master(f"Load teacher with lora rank: {model_args.lora_r}")
+        print_master(f"Teacher use lora: {model_args.lora}")
         teacher = MMEBModel.load(model_args, is_trainable=False)
         for param in teacher.parameters():
             param.requires_grad = False
-        print("Teacher model loaded.")
+        print_master("Teacher model loaded.")
         return teacher
     
     def get_student_processor(self):
         processor = load_processor(self.model_args, None)
-        print("Student processor loaded.")
+        print_master("Student processor loaded.")
         return processor
 
     def get_teacher_processor(self):
         model_args = self._create_model_args('teacher')
         processor = load_processor(model_args, None)
-        print("Teacher processor loaded.")
+        print_master("Teacher processor loaded.")
         return processor
     
     def forward(self, criterion, batch):
@@ -211,7 +211,7 @@ class Distiller(nn.Module):
                 projector_list.append(projector)
 
             self.projectors = projector_list
-        print(f"Created {len(self.projectors)} linear projectors.")
+        print_master(f"Created {len(self.projectors)} linear projectors.")
     
     def add_optimizer_param_group(self, optimizer):
         if hasattr(self, 'projectors') and self.projectors is not None:
@@ -220,7 +220,7 @@ class Distiller(nn.Module):
                 "params": self.projectors.parameters(),
                 "lr": lr
             })
-        print("Projector parameters added to optimizer.")
+        print_master("Projector parameters added to optimizer.")
         return optimizer
 class DistillationCollator:
     def __init__(self, student_processor: ProcessorMixin, teacher_processor: ProcessorMixin,
@@ -376,7 +376,7 @@ class DistillationDataset(Dataset):
             stu_pos_image = self._get_image(pos_image_path, student_backbone)
 
             if (not stu_qry_text and not stu_qry_image) or (not stu_pos_text and not stu_pos_image):
-                print("empty inputs")
+                print_master("empty inputs")
                 continue
             
             student_qry_texts.append(stu_qry_text)
@@ -392,7 +392,7 @@ class DistillationDataset(Dataset):
             teacher_pos_image = self._get_image(pos_image_path, teacher_backbone)
 
             if (not teacher_qry_text and not teacher_qry_image) or (not teacher_pos_text and not teacher_pos_image):
-                print("empty inputs")
+                print_master("empty inputs")
                 continue
             teacher_qry_texts.append(teacher_qry_text)
             teacher_qry_images.append(teacher_qry_image)

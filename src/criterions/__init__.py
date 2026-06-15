@@ -8,6 +8,7 @@ from .em_kd_llava_ov import EMKDLLavaLoss
 from .span_propose import SpanProposeCriterion
 from .span_propose_attn import SpanProposeCriterionWeighted
 from .span_propose_attn_only_phrase import SpanProposeCriterionWeightedOnlyPhrase
+from .batch_graph import BatchGraphDistillationCriterion
 
 criterion_list = {
     "contrastive_rkd": ContrastiveLossWithRKD,
@@ -20,6 +21,7 @@ criterion_list = {
     "span_propose": SpanProposeCriterion,
     "span_propose_attn": SpanProposeCriterionWeighted,
     "span_propose_attn_only_phrase": SpanProposeCriterionWeightedOnlyPhrase,
+    "batch_graph": BatchGraphDistillationCriterion,
 }
 
 def build_criterion(args):

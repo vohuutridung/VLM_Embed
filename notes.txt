@@ -1,0 +1,34 @@
+# Setup env (ensure u stay in VLM_Embed)
+uv python install 3.11
+alias python="$(uv python find 3.11)"
+python -m venv vlm
+source vlm/bin/activate
+pip install -r requirements.txt
+python fix_lib.py
+
+# Download train_data (for cls only)
+bash scripts/cls/download_traindata_cls.sh
+
+# Download eval_data
+wget https://huggingface.co/datasets/TIGER-Lab/MMEB-eval/resolve/main/images.zip
+unzip images.zip -d eval_images/
+
+# Train
+bash scripts/cls/train_SGD_fastvlm.sh
+
+
+
+
+
+
+
+
+
+
+
+total_loss = (
+    contrastive_loss
+    + (self.kd_weight / 10.0) * rkd_loss
+    + self.kd_weight * token_level_loss
+    + self.kd_weight * self.w_loss_batch * batch_level_loss
+)
