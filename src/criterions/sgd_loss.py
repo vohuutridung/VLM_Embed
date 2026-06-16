@@ -441,7 +441,8 @@ def build_knn_weight_matrix(features, k_neighbors):
         return torch.zeros(n, n, device=features.device, dtype=features.dtype)
 
     k_neighbors = min(k_neighbors, n - 1)
-    dist_sq = compute_pairwise_sq_distances(features)
+    features_fp32 = features.float()
+    dist_sq = compute_pairwise_sq_distances(features_fp32)
 
     nonzero_dists = dist_sq[dist_sq > 0]
     sigma = nonzero_dists.median().item() if nonzero_dists.numel() > 0 else 1.0
@@ -457,7 +458,7 @@ def build_knn_weight_matrix(features, k_neighbors):
     W = (W + W.t()) / 2.0
     diag_idx = torch.arange(n, device=features.device)
     W[diag_idx, diag_idx] = 0.0
-    return W
+    return W.to(features.dtype)
 
 
 def build_bipartite_weight_matrix(features_v, features_t, k_neighbors):
@@ -504,22 +505,27 @@ def compute_laplacian_eigenspace(W, num_eigenvectors, laplacian_type="unnormaliz
     if k_eig < 1:
         return torch.eye(n, device=W.device, dtype=W.dtype)
 
-    D = W.sum(dim=1)
+    # Laplacian in fp32 with diagonal jitter for stable eigh backward.
+    W_fp32 = W.float()
+    D = W_fp32.sum(dim=1)
     if laplacian_type == "normalized":
         D_inv_sqrt = (D + 1e-10).rsqrt().clamp(max=1e8)
-        L = torch.diag(D) - W
+        L = torch.diag(D) - W_fp32
         D_inv_sqrt_mat = torch.diag(D_inv_sqrt)
         L = D_inv_sqrt_mat @ L @ D_inv_sqrt_mat
     else:
-        L = torch.diag(D) - W
+        L = torch.diag(D) - W_fp32
+
+    jitter = 1e-4
+    L = L + jitter * torch.eye(n, device=W.device, dtype=torch.float32)
 
     try:
-        _, eigenvectors = torch.linalg.eigh(L.to(torch.float64))
+        _, eigenvectors = torch.linalg.eigh(L)
     except Exception:
         return torch.eye(n, device=W.device, dtype=W.dtype)
 
-    U = eigenvectors[:, 1:1 + k_eig].to(W.dtype) # (n, k_eig), eigenmap
-    return U @ U.T # (n, n), eigenspace
+    U = eigenvectors[:, 1:1 + k_eig].to(W.dtype)
+    return U @ U.T
 
 
 def compute_grassman_loss(espace_teacher, espace_student):
@@ -994,9 +1000,9 @@ class SGDLoss(nn.Module):
             teacher_qry_reps, teacher_qry_image_features, teacher_qry_attention, teacher_qry_hidden_states = teacher_qry_output
             teacher_pos_reps, teacher_pos_image_features, teacher_pos_attention, teacher_pos_hidden_states = teacher_pos_output
 
-        # Forward student
-        student_qry_output = student_model.encode_input(student_qry_input)
-        student_pos_output = student_model.encode_input(student_pos_input)
+        # Forward student (no attention tensors — only needed for NaN debug dumps)
+        student_qry_output = student_model.encode_input(student_qry_input, output_attentions=False)
+        student_pos_output = student_model.encode_input(student_pos_input, output_attentions=False)
         student_qry_reps, student_qry_image_features, student_qry_attention, student_qry_hidden_states = student_qry_output
         student_pos_reps, student_pos_image_features, student_pos_attention, student_pos_hidden_states = student_pos_output
 

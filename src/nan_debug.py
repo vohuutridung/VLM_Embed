@@ -252,6 +252,25 @@ def loss_is_finite(loss: torch.Tensor) -> bool:
     return bool(torch.isfinite(loss).all().item())
 
 
+def grads_are_finite(module: nn.Module) -> bool:
+    for param in module.parameters():
+        if param.grad is not None and not torch.isfinite(param.grad).all():
+            return False
+    return True
+
+
+def sanitize_grads(module: nn.Module) -> int:
+    """Replace non-finite grad values with 0. Returns count of sanitized tensors."""
+    sanitized = 0
+    for param in module.parameters():
+        if param.grad is None:
+            continue
+        if not torch.isfinite(param.grad).all():
+            param.grad = torch.nan_to_num(param.grad, nan=0.0, posinf=0.0, neginf=0.0)
+            sanitized += 1
+    return sanitized
+
+
 def loss_dict_has_nonfinite(loss_dict: Dict[str, Any]) -> bool:
     return any(
         isinstance(value, torch.Tensor) and not torch.isfinite(value).all()
@@ -404,6 +423,7 @@ class TrainNanDebugger:
         outputs: Dict[str, Any],
         max_grad_norm: float,
     ) -> torch.Tensor:
+        sanitize_grads(self.student)
         grad_norm = torch.nn.utils.clip_grad_norm_(self.student.parameters(), max_grad_norm)
         if not torch.isfinite(grad_norm):
             log_nonfinite_losses(

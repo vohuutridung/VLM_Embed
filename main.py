@@ -37,6 +37,7 @@ from src.nan_debug import (
     TrainNanDebugger,
     configure_nan_debug_logging,
     get_nan_debug_dir,
+    grads_are_finite,
     log_training_output_dirs,
     loss_is_finite,
 )
@@ -678,15 +679,31 @@ def main():
                 nan_debugger.after_backward(step_num, epoch_step, outputs)
 
             if (step + 1) % training_args.gradient_accumulation_steps == 0:
+                grad_norm = None
                 if training_args.max_grad_norm is not None and training_args.max_grad_norm > 0:
-                    nan_debugger.clip_gradients(
+                    grad_norm = nan_debugger.clip_gradients(
                         step_num, epoch_step, outputs, training_args.max_grad_norm
                     )
 
-                optimizer.step()
+                grad_finite = (
+                    torch.isfinite(grad_norm)
+                    if grad_norm is not None
+                    else grads_are_finite(distiller.student)
+                )
+                should_step = finite_loss and grad_finite
+
+                if should_step:
+                    optimizer.step()
+                elif is_main_process():
+                    logger.warning(
+                        f"Skipping optimizer step at global_step={global_step + 1} "
+                        f"(finite_loss={finite_loss}, grad_finite={grad_finite})"
+                    )
+
                 if not finite_loss:
                     nan_debugger.after_optimizer_step(step_num, epoch_step, outputs)
-                lr_scheduler.step()
+                if should_step:
+                    lr_scheduler.step()
                 optimizer.zero_grad()
                 global_step += 1
 

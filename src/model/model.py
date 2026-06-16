@@ -45,7 +45,7 @@ class MMEBModel(nn.Module):
             self.process_rank = dist.get_rank()
             self.world_size = dist.get_world_size()
 
-    def encode_input(self, input):
+    def encode_input(self, input, output_attentions=True):
         INTERNVIDEO2 = "internvideo2"
         if getattr(self, "model_backbone", None) == INTERNVIDEO2:
             if "input_ids" in input.keys():
@@ -116,7 +116,7 @@ class MMEBModel(nn.Module):
             if hasattr(input, 'pixel_values'):
                 input['pixel_values'] = input['pixel_values'].squeeze(1)
                 input['image_sizes'] = input['image_sizes'].squeeze(1)
-            hidden_states = self.encoder(**input, return_dict=True, output_hidden_states=True, output_attentions=True)
+            hidden_states = self.encoder(**input, return_dict=True, output_hidden_states=True, output_attentions=output_attentions)
             # add for image feature
             if hasattr(hidden_states, 'batch_image_embeds'):
                 image_features = hidden_states.batch_image_embeds
@@ -124,32 +124,32 @@ class MMEBModel(nn.Module):
                 image_features = None
             output_hidden_states = hidden_states.hidden_states
             last_hidden_state = hidden_states.hidden_states[-1]
-            attention_matrix = hidden_states.attentions if hasattr(hidden_states, 'attentions') else None
+            attention_matrix = hidden_states.attentions if output_attentions and hasattr(hidden_states, 'attentions') else None
             pooled_output = self._pooling(last_hidden_state, input['attention_mask'])
             return pooled_output, image_features, attention_matrix, output_hidden_states
         elif getattr(self, "model_backbone", None) in [LLAVA_QWEN2, QWEN2_VL]:
             # print("Encoding input for FastVLM model backbone")
-            hidden_states = self.encoder(**input, return_dict=True, output_hidden_states=True, output_attentions=True)
+            hidden_states = self.encoder(**input, return_dict=True, output_hidden_states=True, output_attentions=output_attentions)
             if hasattr(hidden_states, 'batch_image_embeds'):
                 image_features = hidden_states.batch_image_embeds
             else: 
                 image_features = None
             output_hidden_states = hidden_states.hidden_states
             last_hidden_state = hidden_states.hidden_states[-1]
-            attention_matrix = hidden_states.attentions if hasattr(hidden_states, 'attentions') else None
+            attention_matrix = hidden_states.attentions if output_attentions and hasattr(hidden_states, 'attentions') else None
             pooled_output = self._pooling(last_hidden_state, input['attention_mask'])
 
             return pooled_output, image_features, attention_matrix, output_hidden_states
         else:
             # import ipdb; ipdb.set_trace()
-            hidden_states = self.encoder(**input, return_dict=True, output_hidden_states=True, output_attentions=True)
+            hidden_states = self.encoder(**input, return_dict=True, output_hidden_states=True, output_attentions=output_attentions)
             if hasattr(hidden_states, 'batch_image_embeds'):
                 image_features = hidden_states.batch_image_embeds
             else: 
                 image_features = None
             output_hidden_states = hidden_states.hidden_states
             last_hidden_state = hidden_states.hidden_states[-1]
-            attention_matrix = hidden_states.attentions if hasattr(hidden_states, 'attentions') else None
+            attention_matrix = hidden_states.attentions if output_attentions and hasattr(hidden_states, 'attentions') else None
             pooled_output = self._pooling(last_hidden_state, input['attention_mask'])
 
             all_layers_embeds = torch.stack([self._pooling(hidden_state, input['attention_mask']) 
