@@ -58,6 +58,7 @@ KD_LOSS_METRIC_KEYS: Dict[str, Tuple[str, ...]] = {
         "spectral_loss_v",
         "spectral_loss_t",
         "spectral_loss_cross",
+        "local_cross_loss",
         "batch_vision_nodes_qry",
         "batch_text_nodes_qry",
         "batch_vision_nodes_pos",

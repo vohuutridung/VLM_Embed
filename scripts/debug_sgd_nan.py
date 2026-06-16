@@ -67,6 +67,8 @@ def main():
         w_loss_v=1.0,
         w_loss_t=1.0,
         w_loss_cross=1.0,
+        w_loss_local_cross=0.2,
+        local_cross_temperature=0.1,
         grassman_vision_use_cluster=True,
         grassman_text_use_topk=True,
         topk_text_ratio=0.8,
@@ -112,7 +114,7 @@ def main():
         outputs = criterion(distiller, batch)
 
     print("\n=== Forward loss values ===")
-    for k in ["loss", "contrastive_loss", "rkd_loss", "spectral_loss", "spectral_loss_v", "spectral_loss_t", "spectral_loss_cross"]:
+    for k in ["loss", "contrastive_loss", "rkd_loss", "spectral_loss", "spectral_loss_v", "spectral_loss_t", "spectral_loss_cross", "local_cross_loss"]:
         v = outputs[k]
         print(f"  {k}: {v.detach().float().item()}")
 
@@ -124,6 +126,7 @@ def main():
         ("spectral_v", "spectral_loss_v"),
         ("spectral_t", "spectral_loss_t"),
         ("spectral_cross", "spectral_loss_cross"),
+        ("local_cross", "local_cross_loss"),
         ("total", "loss"),
     ]:
         print(test_loss_term(name, outputs[key], student))

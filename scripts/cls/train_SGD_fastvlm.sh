@@ -4,12 +4,15 @@
 NUM_GPUS_PER_NODE=1
 LORA_R=32
 LORA_A=64
-BATCH_SIZE=8
+BATCH_SIZE=16
+GRADIENT_ACCUMULATION_STEPS=1
 
-KD_WEIGHT=1.0
+KD_WEIGHT=0.05
 W_LOSS_V=1.0
-W_LOSS_T=1.0
+W_LOSS_T=0.7
 W_LOSS_CROSS=1.0
+W_LOSS_LOCAL_CROSS=0.2
+LOCAL_CROSS_TEMPERATURE=0.1
 
 # Spectral loss (unified batch-level Grassman KD)
 GRASSMAN_VISION_USE_CLUSTER=True
@@ -56,7 +59,7 @@ torchrun --standalone --nproc_per_node=$NUM_GPUS_PER_NODE $TRAIN_SCRIPT \
     --percent_data 0.05 \
     --output_dir "training/$EXP_NAME" \
     --per_device_train_batch_size $BATCH_SIZE \
-    --gradient_accumulation_steps 1 \
+    --gradient_accumulation_steps $GRADIENT_ACCUMULATION_STEPS \
     --learning_rate 1e-4 \
     --num_train_epochs 1 \
     --bf16 \
@@ -74,6 +77,8 @@ torchrun --standalone --nproc_per_node=$NUM_GPUS_PER_NODE $TRAIN_SCRIPT \
     --w_loss_v $W_LOSS_V \
     --w_loss_t $W_LOSS_T \
     --w_loss_cross $W_LOSS_CROSS \
+    --w_loss_local_cross $W_LOSS_LOCAL_CROSS \
+    --local_cross_temperature $LOCAL_CROSS_TEMPERATURE \
     --grassman_vision_use_cluster $GRASSMAN_VISION_USE_CLUSTER \
     --grassman_text_use_topk $GRASSMAN_TEXT_USE_TOPK \
     --topk_text_ratio $TOPK_TEXT_RATIO \

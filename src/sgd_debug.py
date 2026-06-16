@@ -221,6 +221,7 @@ def build_sgd_loss_dict(
     spectral_loss_v: torch.Tensor,
     spectral_loss_t: torch.Tensor,
     spectral_loss_cross: torch.Tensor,
+    local_cross_loss: torch.Tensor,
     batch_stats: dict,
 ) -> dict:
     return {
@@ -231,6 +232,7 @@ def build_sgd_loss_dict(
         "spectral_loss_v": spectral_loss_v,
         "spectral_loss_t": spectral_loss_t,
         "spectral_loss_cross": spectral_loss_cross,
+        "local_cross_loss": local_cross_loss,
         "batch_vision_nodes_qry": metric_tensor(device, batch_stats["qry_vision_nodes"]),
         "batch_text_nodes_qry": metric_tensor(device, batch_stats["qry_text_nodes"]),
         "batch_vision_nodes_pos": metric_tensor(device, batch_stats["pos_vision_nodes"]),
