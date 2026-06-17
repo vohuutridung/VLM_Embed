@@ -1,15 +1,16 @@
-from huggingface_hub import upload_folder
+from huggingface_hub import create_repo, upload_folder
 
 # 🪪 Access token của bạn
 token = ""
 
 # 📁 Thư mục bạn muốn upload (ví dụ: model, checkpoints, v.v.)
-folder_path = "/workspace/ComfyUI/models/gligen/VLM_Embed/training/no_deepspeed_propose_kd_weight/checkpoint-final"
+folder_path = "/workspace/VLM_Embed/training/SGD_FastVLM_full_cls_r32_bs16/checkpoint-final"
 
-# 🏷️ Repo đã có sẵn trên Hugging Face
-repo_id = "vohuutridung/ten_mo_hinh"
+# 🏷️ Repo trên Hugging Face
+repo_id = "sonspeed/SGD_FastVLM_full_cls_r32_bs16"
 
-# 🚀 Upload toàn bộ folder lên repo đó
+# 🚀 Tạo repo (nếu chưa có) rồi upload
+create_repo(repo_id=repo_id, token=token, exist_ok=True)
 upload_folder(
     folder_path=folder_path,
     repo_id=repo_id,
