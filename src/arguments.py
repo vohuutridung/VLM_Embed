@@ -122,8 +122,13 @@ class TrainingArguments(TrainingArguments):
     # batch graph eigenspace distillation
     w_loss_batch: float = field(default=1.0, metadata={"help": "weight for batch-level eigenspace distillation loss"})
     batch_graph_k: int = field(default=8, metadata={"help": "kNN neighbors for Laplacian eigenmap graph"})
-    batch_graph_num_eigen: int = field(default=16, metadata={"help": "number of eigenvectors for eigenspace projection"})
+    batch_graph_k_min: int = field(default=2, metadata={"help": "minimum number of eigenvectors selected by eigengap"})
+    batch_graph_k_max: int = field(default=16, metadata={"help": "maximum number of eigenvectors selected by eigengap"})
     batch_graph_heat_t: Optional[float] = field(default=None, metadata={"help": "heat kernel bandwidth; None = auto from kNN distances"})
+    batch_graph_laplacian_type: str = field(
+        default="unnormalized",
+        metadata={"help": "Laplacian type for batch graph: unnormalized (D-W) or normalized (I - D^{-1/2}WD^{-1/2})"},
+    )
     wandb_api_key: str = field(default=None, metadata={"help": "optional W&B API key"})
 @dataclass
 class MTEBArguments:

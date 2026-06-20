@@ -8,7 +8,9 @@ BATCH_SIZE=8
 
 W_LOSS_BATCH=1.0
 BATCH_GRAPH_K=8
-BATCH_GRAPH_NUM_EIGEN=16
+BATCH_GRAPH_K_MIN=2
+BATCH_GRAPH_K_MAX=32
+BATCH_GRAPH_LAPLACIAN="unnormalized"
 
 # Configs
 TRAIN_SCRIPT="main.py"
@@ -64,7 +66,9 @@ torchrun --standalone --nproc_per_node=$NUM_GPUS_PER_NODE $TRAIN_SCRIPT \
     --kd_weight $KD_WEIGHT \
     --w_loss_batch $W_LOSS_BATCH \
     --batch_graph_k $BATCH_GRAPH_K \
-    --batch_graph_num_eigen $BATCH_GRAPH_NUM_EIGEN \
+    --batch_graph_k_min $BATCH_GRAPH_K_MIN \
+    --batch_graph_k_max $BATCH_GRAPH_K_MAX \
+    --batch_graph_laplacian_type $BATCH_GRAPH_LAPLACIAN \
     --image_resolution "low" \
     --report_to "wandb" \
     --run_name "$EXP_NAME"
