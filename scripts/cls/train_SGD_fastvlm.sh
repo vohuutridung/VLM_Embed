@@ -11,12 +11,14 @@ KD_WEIGHT=0.05
 W_LOSS_V=1.0
 W_LOSS_T=0.7
 W_LOSS_CROSS=1.0
+W_LOSS_BATCH=1.0
 W_LOSS_LOCAL_CROSS=0.2
 LOCAL_CROSS_TEMPERATURE=0.1
 
-# Spectral loss (unified batch-level Grassman KD)
+# Token-level Grassman + batch CKA
 GRASSMAN_VISION_USE_TOPK=True
 GRASSMAN_TEXT_USE_TOPK=True
+TOPK_VISION_RATIO=0.8
 TOPK_TEXT_RATIO=0.8
 KNN_NEIGHBORS=10
 NUM_EIGENVECTORS=16
@@ -77,10 +79,12 @@ torchrun --standalone --nproc_per_node=$NUM_GPUS_PER_NODE $TRAIN_SCRIPT \
     --w_loss_v $W_LOSS_V \
     --w_loss_t $W_LOSS_T \
     --w_loss_cross $W_LOSS_CROSS \
+    --w_loss_batch $W_LOSS_BATCH \
     --w_loss_local_cross $W_LOSS_LOCAL_CROSS \
     --local_cross_temperature $LOCAL_CROSS_TEMPERATURE \
     --grassman_vision_use_topk $GRASSMAN_VISION_USE_TOPK \
     --grassman_text_use_topk $GRASSMAN_TEXT_USE_TOPK \
+    --topk_vision_ratio $TOPK_VISION_RATIO \
     --topk_text_ratio $TOPK_TEXT_RATIO \
     --knn_neighbors $KNN_NEIGHBORS \
     --num_eigenvectors $NUM_EIGENVECTORS \

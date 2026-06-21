@@ -79,6 +79,7 @@ CLI tương ứng:
 Thiết lập extraction & graph:
 - `--grassman_vision_use_topk $GRASSMAN_VISION_USE_TOPK`
 - `--grassman_text_use_topk $GRASSMAN_TEXT_USE_TOPK`
+- `--topk_vision_ratio $TOPK_VISION_RATIO`
 - `--topk_text_ratio $TOPK_TEXT_RATIO`
 - `--knn_neighbors $KNN_NEIGHBORS`
 - `--num_eigenvectors $NUM_EIGENVECTORS`
@@ -86,7 +87,7 @@ Thiết lập extraction & graph:
 
 Lưu ý:
 - `knn_neighbors` áp dụng cho **v-v**, **t-t**, và cả **v-t bipartite** (kNN hai chiều).
-- `w_loss_batch` **đã bị loại bỏ** (batch-level CKA không còn).
+- `w_loss_batch` dùng cho **batch-level CKA** (attention-pooled text reps).
 
 ### 4.1 Bảng hyperparameters liên quan đến loss (chi tiết)
 
@@ -96,15 +97,16 @@ Nguồn truth: [`src/criterions/sgd_loss.py`](../src/criterions/sgd_loss.py) và
 
 | Hyperparameter | CLI arg | Default (`arguments.py`) | Script set | Ảnh hưởng |
 |---|---:|---:|---:|---|
-| `kd_weight` | `--kd_weight` | `1.0` | `0.05` | Scale cho `spectral_loss`, `local_cross_loss`; scale nhỏ cho `rkd_loss` (chia 10) |
+| `kd_weight` | `--kd_weight` | `1.0` | `0.05` | Scale cho `token_level_loss`, `batch_level_loss`, `local_cross_loss`; RKD `/10` |
 
 #### B) Trọng số của spectral loss
 
 | Hyperparameter | CLI arg | Default (`arguments.py`) | Script set | Ảnh hưởng |
 |---|---:|---:|---:|---|
-| `w_loss_v` | `--w_loss_v` | `1.0` | `1.0` | Trọng số `spectral_loss_v` |
-| `w_loss_t` | `--w_loss_t` | `1.0` | `0.7` | Trọng số `spectral_loss_t` |
-| `w_loss_cross` | `--w_loss_cross` | `1.0` | `1.0` | Trọng số `spectral_loss_cross` |
+| `w_loss_v` | `--w_loss_v` | `1.0` | `1.0` | Trọng số `token_level_loss_v` |
+| `w_loss_t` | `--w_loss_t` | `1.0` | `0.7` | Trọng số `token_level_loss_t` |
+| `w_loss_cross` | `--w_loss_cross` | `1.0` | `1.0` | Trọng số `token_level_loss_cross` |
+| `w_loss_batch` | `--w_loss_batch` | `1.0` | `1.0` | Trọng số `batch_level_loss` (CKA) |
 
 #### C) Local cross-modal affinity loss
 
@@ -121,9 +123,10 @@ Gợi ý tuning:
 
 | Hyperparameter | CLI arg | Default (`arguments.py`) | Script set | Ảnh hưởng |
 |---|---:|---:|---:|---|
-| `grassman_vision_use_topk` | `--grassman_vision_use_topk` | `true` | `True` | Vision nodes = top-k mapped teacher patches (sau spatial overlap align) |
-| `grassman_text_use_topk` | `--grassman_text_use_topk` | `false` | `True` | Text nodes = top-k tokens (sau align) thay vì all text tokens |
-| `topk_text_ratio` | `--topk_text_ratio` | `0.8` | `0.8` | \(k = \max(1, \lfloor ratio \cdot M \rfloor)\) trên tensor text/vision đã align |
+| `grassman_vision_use_topk` | `--grassman_vision_use_topk` | `true` | `True` | Bật top-k vision sau spatial align |
+| `topk_vision_ratio` | `--topk_vision_ratio` | `0.8` | `0.8` | \(k_v\) trên mapped vision patches |
+| `grassman_text_use_topk` | `--grassman_text_use_topk` | `false` | `True` | Bật top-k text sau char-span align |
+| `topk_text_ratio` | `--topk_text_ratio` | `0.8` | `0.8` | \(k_t\) trên aligned text tokens |
 
 #### E) Graph construction + spectral embedding
 
@@ -209,40 +212,21 @@ L(\Delta)=
 - Với mọi triple hợp lệ (không trùng index), tính cosine giữa các hướng sai khác (unit vectors) và so student vs teacher.
 - Dùng Huber như trên, rồi mean.
 
-### 5.3 Unified batch-level spectral loss (`spectral_loss`)
+### 5.3 Token-level spectral loss (`token_level_loss`)
 
-Đây là phần thay thế toàn bộ `token_level_loss` và `batch_level_loss` cũ.
+Grassman KD **trong từng sample** (mỗi `(batch_idx, qry|pos)`):
 
-Luồng tổng quát (mỗi side `qry` và `pos` tính riêng, rồi average):
+1. Extract: spatial vision map + char-span text align + top-k
+2. Build v-v, t-t, v-t graphs trên nodes của sample đó
+3. Grassman loss; average qua các sample-side hợp lệ
 
-1. **Per-sample extraction**
-   - Vision: **spatial bbox overlap mapping** (`align_student_vision_to_teacher_spatial`) — teacher patch anchor → weighted student patches; optional top-k giống text
-   - Text: **map teacher→student bằng char-span overlap có trọng số** (`align_student_to_teacher_by_offsets`), rồi top-k trên tensor đã align (cùng indices hai phía)
-2. **Đẩy lên batch level**
-   - Concat tất cả vision reps của batch → tập đỉnh vision batch
-   - Concat tất cả text reps của batch → tập đỉnh text batch
-3. **Xây đồ thị & spectral KD**
-   - v-v graph: kNN trên vision batch reps
-   - t-t graph: kNN trên text batch reps
-   - v-t graph: bipartite kNN (kNN hai chiều giữa 2 phía)
-   - Từ weight matrix \(W\) → Laplacian → eigenvectors → projection matrix → Grassman loss
+Log: `token_level_loss`, `token_level_loss_v/t/cross`
 
-Ba thành phần được log riêng:
-- `spectral_loss_v` (v-v)
-- `spectral_loss_t` (t-t)
-- `spectral_loss_cross` (v-t)
+### 5.3.1 Batch-level CKA (`batch_level_loss`)
 
-Kết hợp theo trọng số:
+Attention-weighted pool trên text hidden → 1 rep/sample → `CKA(student, teacher)` cho qry và pos.
 
-```text
-spectral_loss_side = w_loss_v * spectral_loss_v
-                  + w_loss_t * spectral_loss_t
-                  + w_loss_cross * spectral_loss_cross
-
-spectral_loss = mean(spectral_loss_qry, spectral_loss_pos)
-```
-
-#### 5.3.1 Text mapping (tóm tắt)
+### 5.3.2 Text mapping (tóm tắt)
 
 1. Build paired character offsets (`build_paired_text_offsets`) — cùng candidate text cho teacher & student, strict khớp `input_ids`
 2. Weighted align: mỗi teacher token = tổ hợp có trọng số các student tokens overlap theo ký tự
@@ -321,7 +305,8 @@ Theo `SGDLoss.forward()`:
 ```text
 total_loss = contrastive_loss
            + (kd_weight / 10) * rkd_loss
-           + kd_weight * spectral_loss
+           + kd_weight * token_level_loss
+           + kd_weight * w_loss_batch * batch_level_loss
            + kd_weight * w_loss_local_cross * local_cross_loss
 ```
 
@@ -339,9 +324,9 @@ Các key chính cho `kd_loss_type="sgd_loss"` được định nghĩa trong:
 
 Bao gồm:
 - `loss`, `contrastive_loss`, `rkd_loss`
-- `spectral_loss`, `spectral_loss_v`, `spectral_loss_t`, `spectral_loss_cross`
+- `token_level_loss`, `token_level_loss_v`, `token_level_loss_t`, `token_level_loss_cross`
+- `batch_level_loss`
 - `local_cross_loss`
-- `batch_vision_nodes_qry`, `batch_text_nodes_qry`, `batch_vision_nodes_pos`, `batch_text_nodes_pos`
 
 ---
 
@@ -367,9 +352,9 @@ Chỉ ghi khi:
 1. Chạy script:
    - `bash scripts/cls/train_SGD_fastvlm.sh`
 2. Kiểm tra log console / `training/$EXP_NAME/train.log`:
-   - Có `train/spectral_loss*`
+   - Có `train/token_level_loss*`
+   - Có `train/batch_level_loss`
    - Có `train/local_cross_loss`
-   - Có `train/batch_vision_nodes_*`, `train/batch_text_nodes_*`
 3. Nếu có warning:
    - Kiểm tra `training/$EXP_NAME/nan_debug/` có `nan_debug.log` và file trong `events/`
 4. Nếu `local_cross_loss` ≈ 0 liên tục:

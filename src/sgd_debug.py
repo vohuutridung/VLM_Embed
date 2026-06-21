@@ -194,22 +194,46 @@ def batch_side_stats_from_debug(batch_debug: dict) -> dict:
 class SGDSpectralDebugSession:
     def __init__(self):
         self.entries: List[dict] = []
-        self.batch_stats = {
-            "qry_vision_nodes": 0,
-            "qry_text_nodes": 0,
-            "pos_vision_nodes": 0,
-            "pos_text_nodes": 0,
-        }
+        self.batch_node_stats: Dict[str, float] = {}
 
-    def maybe_record_sample_warning(self, sample_debug: dict) -> None:
-        if sample_extraction_needs_warning(sample_debug):
-            self.entries.append(sample_debug)
+    def record_sample(self, sample_debug: dict) -> None:
+        self.entries.append(sample_debug)
 
-    def record_batch_side(self, side: str, batch_debug: dict) -> None:
-        self.entries.append(batch_debug)
-        stats = batch_side_stats_from_debug(batch_debug)
-        self.batch_stats[f"{side}_vision_nodes"] = stats["vision_nodes"]
-        self.batch_stats[f"{side}_text_nodes"] = stats["text_nodes"]
+    def set_batch_node_stats(self, stats: Dict[str, float]) -> None:
+        self.batch_node_stats = stats
+
+
+def compute_batch_avg_node_stats(
+    vision_node_sum: Dict[str, float],
+    vision_node_count: Dict[str, int],
+    text_node_sum: Dict[str, float],
+    text_node_count: Dict[str, int],
+) -> Dict[str, float]:
+    """Average graph node counts per sample-side (after extraction, before spectral)."""
+
+    def _avg(side: str, sums: Dict[str, float], counts: Dict[str, int]) -> float:
+        count = counts.get(side, 0)
+        if count <= 0:
+            return 0.0
+        return sums[side] / count
+
+    total_vision_count = vision_node_count.get("qry", 0) + vision_node_count.get("pos", 0)
+    total_text_count = text_node_count.get("qry", 0) + text_node_count.get("pos", 0)
+    total_vision_sum = vision_node_sum.get("qry", 0.0) + vision_node_sum.get("pos", 0.0)
+    total_text_sum = text_node_sum.get("qry", 0.0) + text_node_sum.get("pos", 0.0)
+
+    return {
+        "avg_vision_nodes_qry": _avg("qry", vision_node_sum, vision_node_count),
+        "avg_vision_nodes_pos": _avg("pos", vision_node_sum, vision_node_count),
+        "avg_text_nodes_qry": _avg("qry", text_node_sum, text_node_count),
+        "avg_text_nodes_pos": _avg("pos", text_node_sum, text_node_count),
+        "avg_vision_nodes": (
+            total_vision_sum / total_vision_count if total_vision_count > 0 else 0.0
+        ),
+        "avg_text_nodes": (
+            total_text_sum / total_text_count if total_text_count > 0 else 0.0
+        ),
+    }
 
 
 def build_sgd_loss_dict(
@@ -217,26 +241,31 @@ def build_sgd_loss_dict(
     total_loss: torch.Tensor,
     contrastive_loss: torch.Tensor,
     rkd_loss: torch.Tensor,
-    spectral_loss: torch.Tensor,
-    spectral_loss_v: torch.Tensor,
-    spectral_loss_t: torch.Tensor,
-    spectral_loss_cross: torch.Tensor,
+    token_level_loss: torch.Tensor,
+    token_level_loss_v: torch.Tensor,
+    token_level_loss_t: torch.Tensor,
+    token_level_loss_cross: torch.Tensor,
+    batch_level_loss: torch.Tensor,
     local_cross_loss: torch.Tensor,
-    batch_stats: dict,
+    batch_node_stats: Optional[Dict[str, float]] = None,
 ) -> dict:
+    batch_node_stats = batch_node_stats or {}
     return {
         "loss": total_loss,
         "contrastive_loss": contrastive_loss,
         "rkd_loss": rkd_loss,
-        "spectral_loss": spectral_loss,
-        "spectral_loss_v": spectral_loss_v,
-        "spectral_loss_t": spectral_loss_t,
-        "spectral_loss_cross": spectral_loss_cross,
+        "token_level_loss": token_level_loss,
+        "token_level_loss_v": token_level_loss_v,
+        "token_level_loss_t": token_level_loss_t,
+        "token_level_loss_cross": token_level_loss_cross,
+        "batch_level_loss": batch_level_loss,
         "local_cross_loss": local_cross_loss,
-        "batch_vision_nodes_qry": metric_tensor(device, batch_stats["qry_vision_nodes"]),
-        "batch_text_nodes_qry": metric_tensor(device, batch_stats["qry_text_nodes"]),
-        "batch_vision_nodes_pos": metric_tensor(device, batch_stats["pos_vision_nodes"]),
-        "batch_text_nodes_pos": metric_tensor(device, batch_stats["pos_text_nodes"]),
+        "avg_vision_nodes": metric_tensor(device, batch_node_stats.get("avg_vision_nodes", 0.0)),
+        "avg_text_nodes": metric_tensor(device, batch_node_stats.get("avg_text_nodes", 0.0)),
+        "avg_vision_nodes_qry": metric_tensor(device, batch_node_stats.get("avg_vision_nodes_qry", 0.0)),
+        "avg_vision_nodes_pos": metric_tensor(device, batch_node_stats.get("avg_vision_nodes_pos", 0.0)),
+        "avg_text_nodes_qry": metric_tensor(device, batch_node_stats.get("avg_text_nodes_qry", 0.0)),
+        "avg_text_nodes_pos": metric_tensor(device, batch_node_stats.get("avg_text_nodes_pos", 0.0)),
     }
 
 
@@ -252,9 +281,47 @@ def _fmt_graph(name: str, graph: Dict[str, Any]) -> str:
 
 
 def _split_grassman_debug_entries(grassman_debug: list):
-    batch_entries = [e for e in grassman_debug if e.get("type") == "batch_side"]
-    sample_entries = [e for e in grassman_debug if e.get("type") != "batch_side"]
-    return batch_entries, sample_entries
+    sample_spectral = [e for e in grassman_debug if e.get("type") == "sample_spectral"]
+    other = [e for e in grassman_debug if e.get("type") != "sample_spectral"]
+    return sample_spectral, other
+
+
+def _sample_spectral_debug_has_warning(entry: dict) -> bool:
+    if sample_extraction_needs_warning(entry):
+        return True
+    vision = entry.get("vision") or {}
+    text = entry.get("text") or {}
+    cross = entry.get("cross") or {}
+    vision_nodes = vision.get("topk_tokens") or vision.get("graph_nodes") or vision.get("teacher_graph_nodes") or 0
+    text_nodes = text.get("topk_tokens") or text.get("num_tokens") or 0
+    if vision_nodes >= 2 and not vision.get("vision_loss_valid", False):
+        return True
+    if text_nodes >= 2 and not text.get("text_loss_valid", False):
+        return True
+    if cross.get("total_nodes", 0) >= 3 and not cross.get("cross_loss_valid", False):
+        return True
+    for section in (vision, text, cross):
+        if section.get("skip_reason"):
+            return True
+    return False
+
+
+def _format_sample_spectral_debug_entry(entry: dict) -> list:
+    vision = entry.get("vision") or {}
+    text = entry.get("text") or {}
+    cross = entry.get("cross") or {}
+    losses = entry.get("losses") or {}
+    lines = [
+        f"  [b{entry.get('batch_idx', '?')}/{entry.get('side', '?')}] "
+        f"v_ok={vision.get('vision_loss_valid', False)} "
+        f"t_ok={text.get('text_loss_valid', False)} "
+        f"cross_ok={cross.get('cross_loss_valid', False)} "
+        f"losses v={losses.get('v', 0):.4f} t={losses.get('t', 0):.4f} cross={losses.get('cross', 0):.4f}"
+    ]
+    for label, section in (("vision", vision), ("text", text), ("cross", cross)):
+        if section.get("skip_reason"):
+            lines.append(f"    {label}_skip={section['skip_reason']}")
+    return lines
 
 
 def _format_batch_side_debug_entry(entry: dict) -> list:
@@ -348,26 +415,30 @@ def format_grassman_debug_lines(grassman_debug: list) -> list:
     if not grassman_debug:
         return ["grassman: no entries"]
 
-    batch_entries, sample_entries = _split_grassman_debug_entries(grassman_debug)
+    sample_spectral, other = _split_grassman_debug_entries(grassman_debug)
+    warning_count = sum(1 for e in sample_spectral if _sample_spectral_debug_has_warning(e))
     lines = [
-        f"grassman: batch_sides={len(batch_entries)} "
-        f"sample_warnings={len(sample_entries)}"
+        f"grassman: sample_spectral={len(sample_spectral)} "
+        f"warnings={warning_count} other={len(other)}"
     ]
 
-    for entry in batch_entries:
-        lines.extend(_format_batch_side_debug_entry(entry))
+    warned = [e for e in sample_spectral if _sample_spectral_debug_has_warning(e)]
+    if warned:
+        lines.append("  sample spectral warnings (first 8):")
+        for entry in warned[:8]:
+            lines.extend(_format_sample_spectral_debug_entry(entry))
 
-    if sample_entries:
-        lines.append("  sample extraction warnings:")
-        lines.extend(_format_sample_warning_entry(entry) for entry in sample_entries)
+    if other:
+        lines.append("  other entries:")
+        lines.extend(_format_sample_warning_entry(entry) for entry in other[:8])
 
     return lines
 
 
 def grassman_debug_has_warning(grassman_debug: list) -> bool:
-    batch_entries, sample_entries = _split_grassman_debug_entries(grassman_debug)
-    if any(_batch_side_debug_has_warning(entry) for entry in batch_entries):
+    sample_spectral, other = _split_grassman_debug_entries(grassman_debug)
+    if any(_sample_spectral_debug_has_warning(entry) for entry in sample_spectral):
         return True
-    if any(_sample_warning_debug_has_warning(entry) for entry in sample_entries):
+    if any(_sample_warning_debug_has_warning(entry) for entry in other):
         return True
     return False

@@ -1,7 +1,7 @@
 # SGDLoss — Tổng quan loss
 
 Tài liệu theo dõi cấu trúc loss hiện tại của [`src/criterions/sgd_loss.py`](../src/criterions/sgd_loss.py).  
-Cập nhật lần cuối: thêm **local cross-modal affinity loss** + **weighted char-span text mapping**.
+Cập nhật lần cuối: **token-level Grassman spectral** (per sample) + **batch-level CKA** + local cross.
 
 ---
 
@@ -10,7 +10,8 @@ Cập nhật lần cuối: thêm **local cross-modal affinity loss** + **weighte
 ```
 loss = contrastive_loss
      + (kd_weight / 10) * rkd_loss
-     + kd_weight * spectral_loss
+     + kd_weight * token_level_loss
+     + kd_weight * w_loss_batch * batch_level_loss
      + kd_weight * w_loss_local_cross * local_cross_loss
 ```
 
@@ -18,7 +19,8 @@ loss = contrastive_loss
 |------------|-------------------|------------|
 | `contrastive_loss` | 1.0 (implicit) | InfoNCE trên embedding pooled query ↔ positive |
 | `rkd_loss` | `kd_weight / 10` | Relational KD (distance + angle) trên rep pooled |
-| `spectral_loss` | `kd_weight` | Grassman / Laplacian spectral KD ở batch level |
+| `token_level_loss` | `kd_weight` | Grassman spectral KD **trong từng sample** (v-v, t-t, v-t) |
+| `batch_level_loss` | `kd_weight * w_loss_batch` | CKA trên 1 vector đại diện / sample (attention pool text) |
 | `local_cross_loss` | `kd_weight * w_loss_local_cross` | KL distillation phân phối vision↔text affinity trong từng sample |
 
 ---
@@ -54,72 +56,64 @@ rkd_loss = (rkd_distance_loss + rkd_angle_loss) / 2
 
 ---
 
-## 3. Spectral loss (unified batch-level Grassman KD)
+## 3. Token-level spectral loss (Grassman KD per sample)
 
-Thay thế loss cũ:
-- ~~`token_level_loss`~~ (Grassman per-sample)
-- ~~`batch_level_loss`~~ (CKA trên pooled reps)
+Mỗi cặp `(batch_idx, side)` với `side ∈ {qry, pos}`:
 
-### Luồng tính
+1. **Extract reps:** spatial vision mapping + char-span text align + optional top-k (vision/text)
+2. **Build graphs trong sample:**
+   - v-v: kNN trên vision nodes (`Nv ≥ 2`)
+   - t-t: kNN trên text nodes (`Nt ≥ 2`)
+   - v-t: bipartite kNN (`Nv + Nt ≥ 3`)
+3. **Grassman loss** trên Laplacian eigenspace teacher vs student
+4. **Average** qua các sample-side hợp lệ (riêng cho v, t, cross)
 
-```mermaid
-flowchart TB
-    subgraph per_sample [Per sample]
-        V[Cluster vision teacher → reps]
-        TM[Map text teacher→student char-span]
-        T[TopK text tokens đã align]
-        LC[Local cross affinity KL]
-    end
-    subgraph batch [Batch level - riêng qry và pos]
-        CAT[Concat tất cả vision + text reps]
-        VV[v-v graph kNN]
-        TT[t-t graph kNN]
-        VT[v-t bipartite kNN]
-        G[Grassman loss trên Laplacian eigenspace]
-    end
-    per_sample --> CAT
-    per_sample --> LC
-    CAT --> VV --> G
-    CAT --> TT --> G
-    CAT --> VT --> G
-```
-
-1. **Per sample:** map vision teacher→student bằng spatial bbox overlap có trọng số; map text tương tự char-span; top-k trên tensor đã align (vision + text); tính `local_cross_loss` (xem §4).
-2. **Batch (qry / pos tách riêng):** concat reps → build 3 đồ thị teacher & student.
-3. **Grassman loss:** `||Π_teacher − Π_student||²_F` trên eigenspace Laplacian.
-4. **Average** loss giữa side `qry` và `pos`.
-
-### Ba thành phần spectral
-
-| Key | Đồ thị | Điều kiện tối thiểu |
-|-----|--------|---------------------|
-| `spectral_loss_v` | Vision–vision (kNN trên spatially mapped patch reps batch) | ≥ 2 vision nodes / side |
-| `spectral_loss_t` | Text–text (kNN trên topk text reps batch) | ≥ 2 text nodes / side |
-| `spectral_loss_cross` | Vision–text bipartite (kNN 2 chiều, full batch) | ≥ 3 nodes tổng (v+t) / side |
+| Key | Đồ thị | Điều kiện |
+|-----|--------|-----------|
+| `token_level_loss_v` | Vision–vision trong 1 sample | `Nv ≥ 2` |
+| `token_level_loss_t` | Text–text trong 1 sample | `Nt ≥ 2` |
+| `token_level_loss_cross` | Vision–text bipartite trong 1 sample | `Nv + Nt ≥ 3` |
 
 ```
-spectral_loss_side = w_loss_v * L_v + w_loss_t * L_t + w_loss_cross * L_cross
-spectral_loss = mean(spectral_loss_qry, spectral_loss_pos)
+token_level_loss = w_loss_v * L_v + w_loss_t * L_t + w_loss_cross * L_cross
 ```
 
-### Hyperparameters spectral (`arguments.py`)
+(L_v, L_t, L_cross là mean over valid sample-side entries.)
+
+### Hyperparameters token-level (graph + top-k)
 
 | Arg | Default | Ý nghĩa |
 |-----|---------|---------|
-| `kd_weight` | 1.0 | Nhân cho `spectral_loss`, `local_cross_loss` (và `/10` cho RKD) |
-| `w_loss_v` | 1.0 | Trọng số vision spectral |
-| `w_loss_t` | 1.0 | Trọng số text spectral |
-| `w_loss_cross` | 1.0 | Trọng số cross-modal spectral |
-| `grassman_vision_use_topk` | true | TopK vision vs toàn bộ mapped teacher patches |
-| `grassman_text_use_topk` | false | TopK text vs toàn bộ text tokens |
-| `topk_text_ratio` | 0.8 | Tỷ lệ topk text và vision (khi bật top-k tương ứng) |
+| `w_loss_v` / `w_loss_t` / `w_loss_cross` | 1.0 | Trọng số v-v / t-t / v-t trong `token_level_loss` |
+| `grassman_vision_use_topk` | true | Bật top-k vision sau spatial map |
+| `topk_vision_ratio` | 0.8 | \(k_v = \max(1, \lfloor ratio \cdot M_v \rfloor)\) trên mapped vision patches |
+| `grassman_text_use_topk` | false | Bật top-k text sau char-span align |
+| `topk_text_ratio` | 0.8 | \(k_t = \max(1, \lfloor ratio \cdot M_t \rfloor)\) trên aligned text tokens |
 | `knn_neighbors` | 10 | k cho v-v, t-t, v-t |
-| `num_eigenvectors` | 16 | Số eigenvector Laplacian (không tính v₀) |
-| `laplacian_type` | `unnormalized` | `unnormalized` hoặc `normalized` |
+| `num_eigenvectors` | 16 | Số eigenvector Laplacian |
+| `laplacian_type` | `unnormalized` | Loại Laplacian |
+
+`kd_weight` scale toàn bộ KD (token-level, batch CKA, local cross, RKD `/10`) — xem § công thức tổng.
 
 ---
 
-## 4. Local cross-modal affinity loss
+## 4. Batch-level CKA loss
+
+**1 vector đại diện / sample / side** từ attention-weighted pool trên **text hidden** (layer cuối):
+
+- Importance = `sum(attention)` theo sequence (mean heads)
+- Mask chỉ text tokens (teacher: cuối seq; student: sau vision)
+- Weight normalize → weighted sum hidden → rep `[D]`
+- Stack batch → `CKA(s_reps, t_reps)` cho qry và pos, average
+
+**Metric log:** `batch_level_loss`  
+**Arg:** `w_loss_batch` (default `1.0`) — nhân thêm sau `kd_weight`.
+
+**Lưu ý:** Student forward cần `output_attentions=True`.
+
+---
+
+## 5. Local cross-modal affinity loss
 
 Bổ sung **local grounding trong từng sample** — teacher gán text token / patch ảnh nào quan trọng với nhau; student học cùng phân phối quan hệ mà không cần khớp trực tiếp hidden dimension.
 
@@ -181,7 +175,7 @@ Dùng cho cả spectral text nodes và local cross loss. Không ghép index thô
    - Ma trận overlap `[Nt, Ns]` = độ dài char-span giao nhau
    - Mỗi teacher token `i`: `s_aligned[i] = Σ_j w_{ij} * s_hidden[j]`, `w_{ij} ∝ overlap[i,j]`
    - `t_aligned[i] = t_hidden[i]`
-5. **Top-k** (`select_topk_tokens_by_last_token_cosine`) trên tensor **đã align**; cùng indices cho teacher và student.
+5. **Top-k** (`select_topk_tokens_by_last_token_cosine`) trên tensor **đã align** nếu `grassman_text_use_topk=True`; ratio = `topk_text_ratio`.
 
 ### Skip reasons (text)
 
@@ -207,7 +201,7 @@ Spatial-only mapping — **không cluster**. Teacher patch là anchor; student p
    - Ma trận overlap `[Nt, Ns]` = diện tích giao nhau bbox 2D
    - Mỗi teacher patch `i`: `s_aligned[i] = Σ_j w_{ij} * s_hidden[j]`, `w_{ij} ∝ overlap[i,j]`
    - `t_aligned[i] = t_hidden[i]`
-4. **Top-k** (`select_topk_tokens_by_last_token_cosine`) trên tensor **đã align** nếu `grassman_vision_use_topk=True`; cùng indices cho teacher và student (`topk_text_ratio`).
+4. **Top-k** nếu `grassman_vision_use_topk=True`; ratio = `topk_vision_ratio`; cùng indices cho teacher và student.
 
 Output: `h_t_v`, `h_s_v` cùng số node `Nv` — dùng cho spectral (cấu trúc quan hệ) và local cross, không so trực tiếp hidden khác chiều.
 
@@ -231,22 +225,23 @@ Output: `h_t_v`, `h_s_v` cùng số node `Nv` — dùng cho spectral (cấu trú
 | `loss` | ✓ | Tổng weighted |
 | `contrastive_loss` | ✓ | |
 | `rkd_loss` | ✓ | |
-| `spectral_loss` | ✓ | Combined weighted qry+pos |
-| `spectral_loss_v` | ✓* | *Qua `spectral_loss`; log riêng để monitor |
-| `spectral_loss_t` | ✓* | |
-| `spectral_loss_cross` | ✓* | |
-| `local_cross_loss` | ✓ | Per-sample affinity KL; scale `kd_weight * w_loss_local_cross` |
+| `token_level_loss` | ✓ | Combined v/t/cross (weighted) |
+| `token_level_loss_v` | ✓* | *Qua `token_level_loss`; monitor |
+| `token_level_loss_t` | ✓* | |
+| `token_level_loss_cross` | ✓* | |
+| `batch_level_loss` | ✓ | CKA attention-pooled reps |
+| `local_cross_loss` | ✓ | Per-sample affinity KL |
 
-### Metrics theo dõi (không phải loss term riêng)
+### Metrics theo dõi (số node sau extraction, trung bình sample-side trong batch)
 
 | Key | Ý nghĩa |
 |-----|---------|
-| `batch_vision_nodes_qry` | Số đỉnh vision trong đồ thị batch (query) |
-| `batch_text_nodes_qry` | Số đỉnh text trong đồ thị batch (query) |
-| `batch_vision_nodes_pos` | Số đỉnh vision (positive) |
-| `batch_text_nodes_pos` | Số đỉnh text (positive) |
+| `avg_vision_nodes` | Trung bình số vision nodes / sample-side (qry+pos) |
+| `avg_text_nodes` | Trung bình số text nodes / sample-side |
+| `avg_vision_nodes_qry` / `avg_vision_nodes_pos` | Tách theo side |
+| `avg_text_nodes_qry` / `avg_text_nodes_pos` | Tách theo side |
 
-Các metric này log qua `train.log` / W&B mỗi `logging_steps` (xem `KD_LOSS_METRIC_KEYS["sgd_loss"]` trong `main.py`).
+Các metric này log qua `KD_LOSS_METRIC_KEYS["sgd_loss"]` trong `main.py`.
 
 ---
 
@@ -254,7 +249,7 @@ Các metric này log qua `train.log` / W&B mỗi `logging_steps` (xem `KD_LOSS_M
 
 | Module | Vai trò |
 |--------|---------|
-| [`src/sgd_debug.py`](../src/sgd_debug.py) | Thu thập & format debug spectral (batch nodes, graph stats) |
+| [`src/sgd_debug.py`](../src/sgd_debug.py) | Per-sample spectral debug, `build_sgd_loss_dict` |
 | [`src/nan_debug.py`](../src/nan_debug.py) | Ghi file khi NaN hoặc grassman warning |
 
 **Đường dẫn file debug:** `{output_dir}/nan_debug/`  
@@ -282,9 +277,9 @@ Chỉ ghi khi loss non-finite hoặc spectral graph / extraction có warning.
 
 | Trước | Hiện tại |
 |-------|----------|
-| `token_level_loss` (Grassman per-sample) | Gộp vào `spectral_loss` (batch-level) |
-| `batch_level_loss` (CKA pooled) | **Đã xóa** |
-| `w_loss_batch` | **Đã xóa** |
-| Text map index-i | **Weighted char-span overlap** (`align_student_to_teacher_by_offsets`) |
-| Chỉ batch spectral cross-modal | Thêm **`local_cross_loss`** per-sample affinity KL |
-| Log cluster per-sample | Log `batch_*_nodes` + debug file khi warning |
+| `spectral_loss` (batch-concat Grassman) | **`token_level_loss`** (Grassman per sample) |
+| (đã xóa) `batch_level_loss` | **Khôi phục** CKA attention pool |
+| `w_loss_batch` | **Khôi phục** (default `1.0`) |
+| Vision cluster DBSCAN | **Spatial bbox overlap** mapping |
+| Text map index-i | **Weighted char-span overlap** |
+| — | **`local_cross_loss`** per-sample affinity KL |

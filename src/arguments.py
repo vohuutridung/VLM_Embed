@@ -132,13 +132,21 @@ class TrainingArguments(TrainingArguments):
         default=False,
         metadata={"help": "If True, select top-k text tokens by cosine with the last token for the text graph; if False, use all text tokens"},
     )
-    topk_text_ratio: float = field(default=0.8, metadata={"help": "ratio of top-k tokens selected by last-token cosine for text and vision graphs (when respective top-k flags are True)"})
+    topk_vision_ratio: float = field(
+        default=0.8,
+        metadata={"help": "ratio of top-k vision nodes after spatial align (when grassman_vision_use_topk=True)"},
+    )
+    topk_text_ratio: float = field(
+        default=0.8,
+        metadata={"help": "ratio of top-k text tokens after char-span align (when grassman_text_use_topk=True)"},
+    )
     knn_neighbors: int = field(default=10, metadata={"help": "number of neighbors for kNN graph construction"})
     num_eigenvectors: int = field(default=16, metadata={"help": "number of eigenvectors for Laplacian Eigenmaps (excluding v_0)"})
     laplacian_type: str = field(default="unnormalized", metadata={"help": "type of Laplacian: unnormalized or normalized"})
     w_loss_v: float = field(default=1.0, metadata={"help": "weight for vision Grassman loss"})
     w_loss_t: float = field(default=1.0, metadata={"help": "weight for text Grassman loss"})
     w_loss_cross: float = field(default=1.0, metadata={"help": "weight for cross-modal Grassman loss"})
+    w_loss_batch: float = field(default=1.0, metadata={"help": "weight for batch-level CKA loss"})
     w_loss_local_cross: float = field(
         default=0.2,
         metadata={"help": "weight for per-sample local vision-text affinity KL loss"},

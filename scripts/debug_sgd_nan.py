@@ -67,10 +67,12 @@ def main():
         w_loss_v=1.0,
         w_loss_t=1.0,
         w_loss_cross=1.0,
+        w_loss_batch=1.0,
         w_loss_local_cross=0.2,
         local_cross_temperature=0.1,
         grassman_vision_use_topk=True,
         grassman_text_use_topk=True,
+        topk_vision_ratio=0.8,
         topk_text_ratio=0.8,
         knn_neighbors=10,
         num_eigenvectors=16,
@@ -114,7 +116,11 @@ def main():
         outputs = criterion(distiller, batch)
 
     print("\n=== Forward loss values ===")
-    for k in ["loss", "contrastive_loss", "rkd_loss", "spectral_loss", "spectral_loss_v", "spectral_loss_t", "spectral_loss_cross", "local_cross_loss"]:
+    for k in [
+        "loss", "contrastive_loss", "rkd_loss",
+        "token_level_loss", "token_level_loss_v", "token_level_loss_t", "token_level_loss_cross",
+        "batch_level_loss", "local_cross_loss",
+    ]:
         v = outputs[k]
         print(f"  {k}: {v.detach().float().item()}")
 
@@ -122,10 +128,11 @@ def main():
     for name, key in [
         ("contrastive", "contrastive_loss"),
         ("rkd", "rkd_loss"),
-        ("spectral", "spectral_loss"),
-        ("spectral_v", "spectral_loss_v"),
-        ("spectral_t", "spectral_loss_t"),
-        ("spectral_cross", "spectral_loss_cross"),
+        ("token_level", "token_level_loss"),
+        ("token_level_v", "token_level_loss_v"),
+        ("token_level_t", "token_level_loss_t"),
+        ("token_level_cross", "token_level_loss_cross"),
+        ("batch_level", "batch_level_loss"),
         ("local_cross", "local_cross_loss"),
         ("total", "loss"),
     ]:
