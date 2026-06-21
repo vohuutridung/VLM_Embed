@@ -15,7 +15,7 @@ W_LOSS_LOCAL_CROSS=0.2
 LOCAL_CROSS_TEMPERATURE=0.1
 
 # Spectral loss (unified batch-level Grassman KD)
-GRASSMAN_VISION_USE_CLUSTER=True
+GRASSMAN_VISION_USE_TOPK=True
 GRASSMAN_TEXT_USE_TOPK=True
 TOPK_TEXT_RATIO=0.8
 KNN_NEIGHBORS=10
@@ -79,7 +79,7 @@ torchrun --standalone --nproc_per_node=$NUM_GPUS_PER_NODE $TRAIN_SCRIPT \
     --w_loss_cross $W_LOSS_CROSS \
     --w_loss_local_cross $W_LOSS_LOCAL_CROSS \
     --local_cross_temperature $LOCAL_CROSS_TEMPERATURE \
-    --grassman_vision_use_cluster $GRASSMAN_VISION_USE_CLUSTER \
+    --grassman_vision_use_topk $GRASSMAN_VISION_USE_TOPK \
     --grassman_text_use_topk $GRASSMAN_TEXT_USE_TOPK \
     --topk_text_ratio $TOPK_TEXT_RATIO \
     --knn_neighbors $KNN_NEIGHBORS \

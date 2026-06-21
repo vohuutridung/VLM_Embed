@@ -84,7 +84,7 @@ flowchart TB
     CAT --> VT --> G
 ```
 
-1. **Per sample:** cluster vision (DBSCAN) + weighted cluster mean; map text teacher→student bằng char-span overlap có trọng số; top-k trên tensor đã align; tính `local_cross_loss` (xem §4).
+1. **Per sample:** map vision teacher→student bằng spatial bbox overlap có trọng số; map text tương tự char-span; top-k trên tensor đã align (vision + text); tính `local_cross_loss` (xem §4).
 2. **Batch (qry / pos tách riêng):** concat reps → build 3 đồ thị teacher & student.
 3. **Grassman loss:** `||Π_teacher − Π_student||²_F` trên eigenspace Laplacian.
 4. **Average** loss giữa side `qry` và `pos`.
@@ -93,7 +93,7 @@ flowchart TB
 
 | Key | Đồ thị | Điều kiện tối thiểu |
 |-----|--------|---------------------|
-| `spectral_loss_v` | Vision–vision (kNN trên cluster reps batch) | ≥ 2 vision nodes / side |
+| `spectral_loss_v` | Vision–vision (kNN trên spatially mapped patch reps batch) | ≥ 2 vision nodes / side |
 | `spectral_loss_t` | Text–text (kNN trên topk text reps batch) | ≥ 2 text nodes / side |
 | `spectral_loss_cross` | Vision–text bipartite (kNN 2 chiều, full batch) | ≥ 3 nodes tổng (v+t) / side |
 
@@ -110,9 +110,9 @@ spectral_loss = mean(spectral_loss_qry, spectral_loss_pos)
 | `w_loss_v` | 1.0 | Trọng số vision spectral |
 | `w_loss_t` | 1.0 | Trọng số text spectral |
 | `w_loss_cross` | 1.0 | Trọng số cross-modal spectral |
-| `grassman_vision_use_cluster` | false | Cluster vision vs dùng toàn bộ tokens |
+| `grassman_vision_use_topk` | true | TopK vision vs toàn bộ mapped teacher patches |
 | `grassman_text_use_topk` | false | TopK text vs toàn bộ text tokens |
-| `topk_text_ratio` | 0.8 | Tỷ lệ topk text |
+| `topk_text_ratio` | 0.8 | Tỷ lệ topk text và vision (khi bật top-k tương ứng) |
 | `knn_neighbors` | 10 | k cho v-v, t-t, v-t |
 | `num_eigenvectors` | 16 | Số eigenvector Laplacian (không tính v₀) |
 | `laplacian_type` | `unnormalized` | `unnormalized` hoặc `normalized` |
@@ -121,13 +121,13 @@ spectral_loss = mean(spectral_loss_qry, spectral_loss_pos)
 
 ## 4. Local cross-modal affinity loss
 
-Bổ sung **local grounding trong từng sample** — teacher gán text token / cluster ảnh nào quan trọng với nhau; student học cùng phân phối quan hệ mà không cần khớp trực tiếp hidden dimension.
+Bổ sung **local grounding trong từng sample** — teacher gán text token / patch ảnh nào quan trọng với nhau; student học cùng phân phối quan hệ mà không cần khớp trực tiếp hidden dimension.
 
 ### Input (sau extraction per sample)
 
 | Tensor | Shape | Nguồn |
 |--------|-------|-------|
-| `V_T`, `V_S` | `[Nv, D_t]`, `[Nv, D_s]` | Vision cluster reps (teacher DBSCAN → map sang student) |
+| `V_T`, `V_S` | `[Nv, D_t]`, `[Nv, D_s]` | Vision patch reps (teacher anchor → spatial overlap map sang student) |
 | `T_T`, `T_S` | `[Nt, D_t]`, `[Nt, D_s]` | Top-k text tokens đã align (cùng số hàng teacher/student) |
 
 `Nv`, `Nt` phải khớp giữa teacher và student. `D_t` và `D_s` **không** cần giống nhau.
@@ -181,7 +181,7 @@ Dùng cho cả spectral text nodes và local cross loss. Không ghép index thô
    - Ma trận overlap `[Nt, Ns]` = độ dài char-span giao nhau
    - Mỗi teacher token `i`: `s_aligned[i] = Σ_j w_{ij} * s_hidden[j]`, `w_{ij} ∝ overlap[i,j]`
    - `t_aligned[i] = t_hidden[i]`
-5. **Top-k** (`select_topk_text_tokens_by_last_token_cosine`) trên tensor **đã align**; cùng indices cho teacher và student.
+5. **Top-k** (`select_topk_tokens_by_last_token_cosine`) trên tensor **đã align**; cùng indices cho teacher và student.
 
 ### Skip reasons (text)
 
@@ -197,12 +197,28 @@ Dùng cho cả spectral text nodes và local cross loss. Không ghép index thô
 
 ## 6. Vision mapping (teacher → student)
 
-| Mode | `grassman_vision_use_cluster` | Cách map |
-|------|-------------------------------|----------|
-| Cluster (mặc định train script) | `true` | DBSCAN trên teacher patches → `map_teacher_clusters_to_student` (spatial) → weighted cluster mean |
-| Token-level | `false` | `map_teacher_tokens_to_student` — 1 teacher patch → 1 student patch theo tọa độ |
+Spatial-only mapping — **không cluster**. Teacher patch là anchor; student patches được gom theo overlap bbox trong không gian ảnh đã scale.
 
-Output: `h_t_v`, `h_s_v` cùng số cluster/node `Nv`.
+### Pipeline
+
+1. **Patch bboxes** (`get_patch_bboxes`): mỗi teacher/student patch → `[x0, y0, x1, y1]` trên lưới patch.
+2. **Scale teacher bbox** sang không gian student (`student_resize / original_width|height`).
+3. **Weighted align** (`align_student_vision_to_teacher_spatial`):
+   - Ma trận overlap `[Nt, Ns]` = diện tích giao nhau bbox 2D
+   - Mỗi teacher patch `i`: `s_aligned[i] = Σ_j w_{ij} * s_hidden[j]`, `w_{ij} ∝ overlap[i,j]`
+   - `t_aligned[i] = t_hidden[i]`
+4. **Top-k** (`select_topk_tokens_by_last_token_cosine`) trên tensor **đã align** nếu `grassman_vision_use_topk=True`; cùng indices cho teacher và student (`topk_text_ratio`).
+
+Output: `h_t_v`, `h_s_v` cùng số node `Nv` — dùng cho spectral (cấu trúc quan hệ) và local cross, không so trực tiếp hidden khác chiều.
+
+### Skip reasons (vision)
+
+| `skip_reason` | Khi nào |
+|---------------|---------|
+| `no_spatial_overlap_pairs` | Ma trận overlap toàn 0 |
+| `mapped_teacher_tokens_lt_2` | Sau align còn < 2 teacher patches |
+| `vision_nodes_lt_2_after_topk` | Sau top-k còn < 2 nodes |
+| `teacher_vision_tokens_lt_2` | Teacher có < 2 vision tokens |
 
 ---
 

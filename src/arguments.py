@@ -124,15 +124,15 @@ class TrainingArguments(TrainingArguments):
     #! new args for sgd loss
     kd_weight: float = field(default=1.0, metadata={"help": "weight of kd loss in total loss"})
     min_samples_dbscan_teacher: int = field(default=2, metadata={"help": "min_samples for DBSCAN when clustering teacher features for span loss"})
-    grassman_vision_use_cluster: bool = field(
-        default=False,
-        metadata={"help": "If True, cluster teacher vision tokens (DBSCAN) and use cluster means for the vision graph; if False, use all vision tokens with spatial teacher-to-student alignment"},
+    grassman_vision_use_topk: bool = field(
+        default=True,
+        metadata={"help": "If True, select top-k vision nodes by cosine with the last mapped teacher patch for the vision graph; if False, use all spatially mapped teacher patches"},
     )
     grassman_text_use_topk: bool = field(
         default=False,
         metadata={"help": "If True, select top-k text tokens by cosine with the last token for the text graph; if False, use all text tokens"},
     )
-    topk_text_ratio: float = field(default=0.8, metadata={"help": "ratio of top-k text tokens selected by attention (only when grassman_text_use_topk=True)"})
+    topk_text_ratio: float = field(default=0.8, metadata={"help": "ratio of top-k tokens selected by last-token cosine for text and vision graphs (when respective top-k flags are True)"})
     knn_neighbors: int = field(default=10, metadata={"help": "number of neighbors for kNN graph construction"})
     num_eigenvectors: int = field(default=16, metadata={"help": "number of eigenvectors for Laplacian Eigenmaps (excluding v_0)"})
     laplacian_type: str = field(default="unnormalized", metadata={"help": "type of Laplacian: unnormalized or normalized"})

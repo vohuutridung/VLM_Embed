@@ -77,7 +77,7 @@ CLI tương ứng:
 - `--local_cross_temperature $LOCAL_CROSS_TEMPERATURE`
 
 Thiết lập extraction & graph:
-- `--grassman_vision_use_cluster $GRASSMAN_VISION_USE_CLUSTER`
+- `--grassman_vision_use_topk $GRASSMAN_VISION_USE_TOPK`
 - `--grassman_text_use_topk $GRASSMAN_TEXT_USE_TOPK`
 - `--topk_text_ratio $TOPK_TEXT_RATIO`
 - `--knn_neighbors $KNN_NEIGHBORS`
@@ -121,10 +121,9 @@ Gợi ý tuning:
 
 | Hyperparameter | CLI arg | Default (`arguments.py`) | Script set | Ảnh hưởng |
 |---|---:|---:|---:|---|
-| `grassman_vision_use_cluster` | `--grassman_vision_use_cluster` | `false` | `True` | Vision nodes = cluster reps (teacher DBSCAN + spatial mapping) |
+| `grassman_vision_use_topk` | `--grassman_vision_use_topk` | `true` | `True` | Vision nodes = top-k mapped teacher patches (sau spatial overlap align) |
 | `grassman_text_use_topk` | `--grassman_text_use_topk` | `false` | `True` | Text nodes = top-k tokens (sau align) thay vì all text tokens |
-| `topk_text_ratio` | `--topk_text_ratio` | `0.8` | `0.8` | \(k = \max(1, \lfloor ratio \cdot M \rfloor)\) trên tensor text đã align |
-| `min_samples_dbscan_teacher` | `--min_samples_dbscan_teacher` | `2` | *(không set)* | Ảnh hưởng DBSCAN clustering cho vision (teacher) |
+| `topk_text_ratio` | `--topk_text_ratio` | `0.8` | `0.8` | \(k = \max(1, \lfloor ratio \cdot M \rfloor)\) trên tensor text/vision đã align |
 
 #### E) Graph construction + spectral embedding
 
@@ -217,7 +216,7 @@ L(\Delta)=
 Luồng tổng quát (mỗi side `qry` và `pos` tính riêng, rồi average):
 
 1. **Per-sample extraction**
-   - Vision: cluster teacher vision tokens (DBSCAN) → weighted cluster mean; map spatial sang student
+   - Vision: **spatial bbox overlap mapping** (`align_student_vision_to_teacher_spatial`) — teacher patch anchor → weighted student patches; optional top-k giống text
    - Text: **map teacher→student bằng char-span overlap có trọng số** (`align_student_to_teacher_by_offsets`), rồi top-k trên tensor đã align (cùng indices hai phía)
 2. **Đẩy lên batch level**
    - Concat tất cả vision reps của batch → tập đỉnh vision batch
@@ -296,7 +295,7 @@ Trong code, \(\Pi_T\) được detach (teacher không backprop).
 
 Bổ sung **local grounding trong từng sample** — không cần hidden dimension teacher/student giống nhau.
 
-Sau extraction (cùng vision cluster reps + top-k text tokens như §5.3), mỗi sample hợp lệ (`Nv ≥ 2`, `Nt ≥ 2`):
+Sau extraction (cùng spatially mapped vision reps + top-k text tokens như §5.3), mỗi sample hợp lệ (`Nv ≥ 2`, `Nt ≥ 2`):
 
 ```text
 A_T = cos(V_T, T_T) / τ
@@ -375,4 +374,4 @@ Chỉ ghi khi:
    - Kiểm tra `training/$EXP_NAME/nan_debug/` có `nan_debug.log` và file trong `events/`
 4. Nếu `local_cross_loss` ≈ 0 liên tục:
    - Kiểm tra debug sample skip (`offset_token_id_mismatch`, `no_character_overlap_pairs`)
-   - Kiểm tra đủ vision clusters (`Nv ≥ 2`) và text top-k (`Nt ≥ 2`)
+   - Kiểm tra đủ vision nodes (`Nv ≥ 2`) và text top-k (`Nt ≥ 2`)

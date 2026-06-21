@@ -69,7 +69,7 @@ def main():
         w_loss_cross=1.0,
         w_loss_local_cross=0.2,
         local_cross_temperature=0.1,
-        grassman_vision_use_cluster=True,
+        grassman_vision_use_topk=True,
         grassman_text_use_topk=True,
         topk_text_ratio=0.8,
         knn_neighbors=10,

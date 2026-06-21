@@ -5,7 +5,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 import numpy as np
-from sklearn.cluster import DBSCAN
 
 from src.nan_debug import log_sgd_forward_debug
 from src.sgd_debug import (
@@ -23,179 +22,101 @@ from src.sgd_debug import (
 logger = logging.getLogger(__name__)
 
 
-# ====== Vision Clustering Functions ======
+# ====== Vision spatial mapping (teacher patch bbox anchor) ======
 
-def get_patch_coordinates(patch_idx, num_patch_per_row, patch_size):
-    """Tinh tọa độ center của patch trên ảnh"""
-    row = patch_idx // num_patch_per_row
-    col = patch_idx % num_patch_per_row
-    center_x = col * patch_size + patch_size / 2
-    center_y = row * patch_size + patch_size / 2
-    return center_x, center_y
-
-def compute_vision_distance_matrix(hidden_states, num_pathches_per_row, patch_size, 
-                                   image_width, image_height, spatial_weight=0.15):
-    # tính distance matrix cho hdbscan
-    num_tokens = hidden_states.size(0)
-    device = hidden_states.device
-    hidden_norm = F.normalize(hidden_states, p=2, dim=-1)
-    sim_matrix = hidden_norm @ hidden_norm.T  # (num_tokens, num_tokens)
-    cosine_distance = 1 - sim_matrix  # (num_tokens, num_tokens)
-    coords = []
-    for i in range(num_tokens):
-        x, y = get_patch_coordinates(i, num_pathches_per_row, patch_size)
-        coords.append([x,y])
-    coords = torch.tensor(coords, dtype=torch.float, device=device)  # (num_tokens, 2)
-    
-    diff = coords.unsqueeze(0) - coords.unsqueeze(1)  # (num_tokens, num_tokens, 2)
-    spatial_distance = torch.sqrt((diff **2).sum(dim=-1) + 1e-8)  # (num_tokens, num_tokens)
-    max_dist = torch.sqrt(torch.tensor(image_width **2 + image_height **2, dtype=torch.float, device=device))
-    spatial_distance_norm = spatial_distance / max_dist  # normalize to [0,1]
-    
-    total_dist = cosine_distance + spatial_weight * spatial_distance_norm
-    return total_dist.cpu().numpy()
-
-def cluster_vision_tokens_hdbscan(hidden_states, num_patches_per_row, patch_size, image_width, image_height,
-                                  min_cluster_size=3, min_samples_dbscan=8):
-    """Phân cụm vision tokens bằng HDBSCAN"""
-    
-    if hidden_states.size(0) < min_cluster_size:
-        return np.zeros(hidden_states.size(0), dtype=np.int32)
-    
-    distance_matrix = compute_vision_distance_matrix(
-        hidden_states, num_patches_per_row, patch_size,
-        image_width, image_height, spatial_weight=0.1
-    )
-    distance_matrix = (distance_matrix + distance_matrix.T) / 2
-    distance_matrix = np.maximum(distance_matrix, 0)
-    np.fill_diagonal(distance_matrix, 0)
-    
-    distance_matrix = distance_matrix.astype(np.float64)
-    
-    # Use DBSCAN here, uncomment to switch back to HDBSCAN if needed
-    D = distance_matrix.copy()
-    D = D[np.triu_indices_from(D, k=1)]
-    eps = np.percentile(D, 3)
-    
-    clusterer = DBSCAN(
-        eps=eps,
-        min_samples=max(1, int(min_samples_dbscan)),
-        metric="precomputed"
-    )
-    # End of DBSCAN
-    
-    # clusterer = hdbscan.HDBSCAN(
-    #     min_cluster_size=min_cluster_size, 
-    #     metric='precomputed',
-    #     allow_single_cluster=True,
-    #     approx_min_span_tree=True,
-    # )
-    cluster_labels = clusterer.fit_predict(distance_matrix)
-    if np.all(cluster_labels == -1):
-        cluster_labels = np.zeros(hidden_states.size(0), dtype=np.int32)
-    return cluster_labels
+def get_patch_bboxes(num_patches, patches_per_row, patch_size, device):
+    """Axis-aligned patch boxes [x0, y0, x1, y1] in patch-grid pixel coordinates."""
+    idx = torch.arange(num_patches, device=device, dtype=torch.float32)
+    rows = torch.div(idx, patches_per_row, rounding_mode="floor")
+    cols = idx % patches_per_row
+    x0 = cols * patch_size
+    y0 = rows * patch_size
+    x1 = x0 + patch_size
+    y1 = y0 + patch_size
+    return torch.stack([x0, y0, x1, y1], dim=1)
 
 
-def map_teacher_clusters_to_student(cluster_labels, 
-                                    teacher_num_patches_per_row, teacher_patch_size, 
-                                    student_num_patches_per_row, student_patch_size,
-                                    original_width, original_height,
-                                    student_resize=1024):
-    """Map cluster labels từ teacher sang student dựa trên vị trí patch"""
-    num_teacher_tokens = len(cluster_labels)
-    num_student_tokens = (student_resize // student_patch_size) ** 2
-    
-    student_cluster_mapping = {}
-    student_token_to_cluster = [-1] * num_student_tokens
-    for teacher_idx in range(num_teacher_tokens):
-        cluster_id = int(cluster_labels[teacher_idx])
-        if cluster_id == -1:
-            continue
-        teacher_x, teacher_y = get_patch_coordinates(
-            teacher_idx, teacher_num_patches_per_row, teacher_patch_size
-        )
-        
-        # Scale về ảnh resize của student
-        scale_x = student_resize / original_width
-        scale_y = student_resize / original_height
-        student_x = teacher_x * scale_x
-        student_y = teacher_y * scale_y
-        
-        student_col = int(student_x // student_patch_size)
-        student_row = int(student_y // student_patch_size)
-        
-        # Clamp để đảm bảo trong range
-        student_col = min(max(student_col, 0), student_num_patches_per_row - 1)
-        student_row = min(max(student_row, 0), student_num_patches_per_row - 1)
-        
-        student_idx = student_row * student_num_patches_per_row + student_col
-        
-        if cluster_id not in student_cluster_mapping:
-            student_cluster_mapping[cluster_id] = set()
-        student_cluster_mapping[cluster_id].add(student_idx)
-        student_token_to_cluster[student_idx] = cluster_id
-        
-    for cluster_id in student_cluster_mapping:
-        student_cluster_mapping[cluster_id] = list(student_cluster_mapping[cluster_id])
-        
-    return student_cluster_mapping, student_token_to_cluster
-
-
-def map_teacher_tokens_to_student(
-    num_teacher_tokens,
-    teacher_num_patches_per_row,
+def align_student_vision_to_teacher_spatial(
+    t_vision_hidden,
+    s_vision_hidden,
+    teacher_patches_per_row,
     teacher_patch_size,
-    student_num_patches_per_row,
+    student_patches_per_row,
     student_patch_size,
     original_width,
     original_height,
-    num_student_tokens,
-    student_resize=1024,
+    student_resize,
 ):
-    """Map each teacher vision token to a spatially corresponding student token index."""
-    student_indices = []
-    for teacher_idx in range(num_teacher_tokens):
-        teacher_x, teacher_y = get_patch_coordinates(
-            teacher_idx, teacher_num_patches_per_row, teacher_patch_size
-        )
-        scale_x = student_resize / original_width
-        scale_y = student_resize / original_height
-        student_x = teacher_x * scale_x
-        student_y = teacher_y * scale_y
-        student_col = int(student_x // student_patch_size)
-        student_row = int(student_y // student_patch_size)
-        student_col = min(max(student_col, 0), student_num_patches_per_row - 1)
-        student_row = min(max(student_row, 0), student_num_patches_per_row - 1)
-        student_idx = student_row * student_num_patches_per_row + student_col
-        student_idx = min(max(student_idx, 0), num_student_tokens - 1)
-        student_indices.append(student_idx)
-    return student_indices
+    """
+    Align student vision patches to teacher vision tokens via 2D bbox overlap.
 
+    Each teacher patch i is the anchor; student patches overlapping its spatial
+    region are aggregated with weights proportional to overlap area.
 
-def prepare_vision_cluster_info(cluster_labels, device):
-    """Chuẩn bị thông tin cluster cho vision tokens"""
-    cluster_labels = np.array(cluster_labels)
-    
-    valid_mask = cluster_labels >= 0
-    if not np.any(valid_mask):
-        return None
-    
-    valid_indices = np.where(valid_mask)[0]
-    valid_clusters = cluster_labels[valid_mask]
-    
-    # Reindex clusters từ 0
-    
-    unique_clusters = np.unique(valid_clusters)
-    cluster_mapping = {old: new for new, old in enumerate(unique_clusters)}
-    remapped_clusters = np.array([cluster_mapping[c] for c in valid_clusters])
-    
-    return {
-        'token_indices': torch.tensor(valid_indices, dtype=torch.long, device=device),
-        'cluster_ids': torch.tensor(remapped_clusters, dtype=torch.long, device=device),
-        'num_clusters': len(unique_clusters),
-        'cluster_mapping': cluster_mapping,
-        'original_labels': cluster_labels
+    Returns:
+        t_aligned: [M, D_t] — teacher hidden states (one row per valid teacher patch)
+        s_aligned: [M, D_s] — weighted student representation for the same teacher patches
+    """
+    debug = {
+        "teacher_vision_tokens": int(t_vision_hidden.size(0)) if t_vision_hidden is not None else 0,
+        "student_vision_tokens": int(s_vision_hidden.size(0)) if s_vision_hidden is not None else 0,
+        "mapped_teacher_tokens": 0,
+        "student_tokens_used": 0,
+        "skip_reason": None,
     }
+
+    if t_vision_hidden is None or s_vision_hidden is None:
+        debug["skip_reason"] = "missing_vision_hidden_states"
+        return None, None, debug
+
+    if original_width <= 0 or original_height <= 0:
+        debug["skip_reason"] = "invalid_image_dimensions"
+        return None, None, debug
+
+    device = t_vision_hidden.device
+    num_teacher = t_vision_hidden.size(0)
+    num_student = s_vision_hidden.size(0)
+
+    t_bboxes = get_patch_bboxes(num_teacher, teacher_patches_per_row, teacher_patch_size, device)
+    s_bboxes = get_patch_bboxes(num_student, student_patches_per_row, student_patch_size, device)
+
+    scale_x = float(student_resize) / float(original_width)
+    scale_y = float(student_resize) / float(original_height)
+    t_bboxes_scaled = t_bboxes.clone()
+    t_bboxes_scaled[:, 0] *= scale_x
+    t_bboxes_scaled[:, 2] *= scale_x
+    t_bboxes_scaled[:, 1] *= scale_y
+    t_bboxes_scaled[:, 3] *= scale_y
+
+    t_x0 = t_bboxes_scaled[:, 0].unsqueeze(1)
+    t_y0 = t_bboxes_scaled[:, 1].unsqueeze(1)
+    t_x1 = t_bboxes_scaled[:, 2].unsqueeze(1)
+    t_y1 = t_bboxes_scaled[:, 3].unsqueeze(1)
+    s_x0 = s_bboxes[:, 0].unsqueeze(0)
+    s_y0 = s_bboxes[:, 1].unsqueeze(0)
+    s_x1 = s_bboxes[:, 2].unsqueeze(0)
+    s_y1 = s_bboxes[:, 3].unsqueeze(0)
+
+    overlap_w = torch.clamp(torch.minimum(t_x1, s_x1) - torch.maximum(t_x0, s_x0), min=0)
+    overlap_h = torch.clamp(torch.minimum(t_y1, s_y1) - torch.maximum(t_y0, s_y0), min=0)
+    overlap = overlap_w * overlap_h
+
+    denom = overlap.sum(dim=1)
+    valid_teacher = denom > 0
+
+    if not valid_teacher.any():
+        debug["skip_reason"] = "no_spatial_overlap_pairs"
+        return None, None, debug
+
+    weights = overlap[valid_teacher] / denom[valid_teacher].unsqueeze(1).clamp(min=1e-8)
+    s_aligned = weights.to(s_vision_hidden.dtype) @ s_vision_hidden
+    t_aligned = t_vision_hidden[valid_teacher]
+
+    debug["mapped_teacher_tokens"] = int(valid_teacher.sum().item())
+    debug["student_tokens_used"] = int((overlap[valid_teacher].sum(dim=0) > 0).sum().item())
+
+    return t_aligned, s_aligned, debug
+
 
 def extract_text_hidden_states(hidden_states, sample_idx, num_text_tokens, num_vision_tokens, 
                                 is_teacher=False, has_image=True):
@@ -511,131 +432,18 @@ def align_student_to_teacher_by_offsets(
     return t_aligned, s_aligned, debug
 
 
-# ========= Attention-Weighted Functions =========
-
-def compute_intra_cluster_attention_weights(hidden_states, cluster_info):
-    """Tính attention weights cho các token trong mỗi cluster dựa trên self-attention giữa các token trong cluster đó"""
-    if cluster_info is None:
-        return None
-    
-    device = hidden_states.device
-    token_indices = cluster_info['token_indices']
-    cluster_ids = cluster_info.get('cluster_ids', cluster_info.get('span_ids'))
-    num_clusters = cluster_info.get('num_clusters', cluster_info.get('num_spans'))
-    
-    # Get hidden states of tokens in clusters
-    H = hidden_states[token_indices]  # (N, D)
-    N = H.size(0)
-    D = H.size(1)
-    
-    if N == 0:
-        return None
-    
-    # Normalize hidden states
-    H_detached = H.detach()
-    std = H_detached.std(dim=-1, keepdim=True) + 1e-6
-    Q = H_detached / std
-    K = H_detached / std
-    
-    # Calculate attention scores (N, N)
-    scores = torch.matmul(Q, K.T) / (D ** 0.5)
-    
-    # Create mask, only keep scores within the same cluster
-    # cluster_ids: (N,)
-    same_cluster_mask = cluster_ids.unsqueeze(0) == cluster_ids.unsqueeze(1)  # (N, N)
-    
-    # Mask diagonal (do not attention to itself)
-    diag_mask = torch.eye(N, device=device, dtype=torch.bool)
-    
-    # Tạo combined mask
-    valid_mask = same_cluster_mask & (~diag_mask)
-    
-    # Đếm số tokens hợp lệ cho mỗi row
-    valid_count_per_row = valid_mask.sum(dim=-1)  # (N,)
-    
-    # Xác định singleton tokens (không có token khác cùng cluster)
-    is_singleton = valid_count_per_row == 0  # (N,)
-    
-    # Apply mask với -inf cho invalid positions
-    scores_masked = scores.masked_fill(~valid_mask, float('-inf'))
-    
-    # Softmax để có attention weights
-    # Với singleton tokens, softmax của all -inf sẽ cho NaN
-    attn_weights = F.softmax(scores_masked, dim=-1)  # (N, N)
-    
-    # Xử lý NaN cho singleton tokens - KHÔNG dùng inplace operation
-    # Thay vì attn_weights[nan_mask] = 0.0, dùng torch.where
-    nan_mask = torch.isnan(attn_weights)
-    attn_weights = torch.where(nan_mask, torch.zeros_like(attn_weights), attn_weights)
-    
-    # Token weight = tổng attention mà token nhận được từ các token khác cùng cluster
-    token_weights = attn_weights.sum(dim=0)  # (N,)
-    
-    # Cho singleton token weight = 1
-    # KHÔNG dùng inplace: token_weights[is_singleton] = 1.0
-    token_weights = torch.where(is_singleton, torch.ones_like(token_weights), token_weights)
-    
-    # Normalize weights trong mỗi cluster để tổng = 1
-    cluster_weight_sum = torch.zeros(num_clusters, device=device, dtype=token_weights.dtype)
-    cluster_weight_sum.scatter_add_(0, cluster_ids, token_weights)
-    cluster_weight_sum = cluster_weight_sum.clamp(min=1e-8)
-    
-    # Gather để lấy tổng weight của cluster tương ứng cho mỗi token
-    token_cluster_sum = cluster_weight_sum[cluster_ids]  # (N,)
-    
-    # Normalize
-    normalized_weights = token_weights / token_cluster_sum  # (N,)
-    
-    return normalized_weights
-
-def compute_weighted_cluster_mean(hidden_states, cluster_info, token_weights):
-    """Calculate weighted cluster means given token weights"""
-    
-    if cluster_info is None or token_weights is None:
-        return None
-    
-    device = hidden_states.device
-    token_indices = cluster_info['token_indices']
-    cluster_ids = cluster_info.get('cluster_ids', cluster_info.get('span_ids'))
-    num_clusters = cluster_info.get('num_clusters', cluster_info.get('num_spans'))
-    D = hidden_states.size(-1)
-    
-    # Get hidden states of tokens in clusters
-    H = hidden_states[token_indices]  # (N, D)
-    H_detached = H.detach()
-    
-    weights_detached = token_weights.detach()
-    
-    # Apply token weights
-    H_weighted = H_detached * weights_detached.unsqueeze(-1)  # (N, D)
-    
-    # Scatter add to sum weighted hidden states per cluster
-    cluster_ids_expanded = cluster_ids.unsqueeze(-1).expand(-1, D)
-    cluster_sum = torch.zeros(num_clusters, D, device=device, dtype=H.dtype)
-    cluster_sum.scatter_add_(0, cluster_ids_expanded, H_weighted)
-    
-    # Calculate weighted for each cluster
-    weight_sum = torch.zeros(num_clusters, device=device, dtype=H.dtype)
-    weight_sum.scatter_add_(0, cluster_ids, token_weights)
-    weight_sum = weight_sum.clamp(min=1e-6).unsqueeze(-1)
-    
-    cluster_mean = cluster_sum / weight_sum  # (num_clusters, D)
-    return cluster_mean
-    
-
-
 # ====== Grassman loss helpers ======
 
-def select_topk_text_tokens_by_last_token_cosine(text_hidden, ratio):
-    """Chọn top-k text tokens theo cosine similarity với last text token (trên teacher)."""
-    num_text = text_hidden.size(0)
-    k = max(1, int(ratio * num_text))
-    k = min(k, num_text)
+def select_topk_tokens_by_last_token_cosine(hidden, ratio):
+    """Chọn top-k tokens theo cosine similarity với token cuối (trên teacher)."""
+    num_tokens = hidden.size(0)
+    k = max(1, int(ratio * num_tokens))
+    k = min(k, num_tokens)
 
-    last_token = text_hidden[-1]  # (D,)
-    text_norm = F.normalize(text_hidden, p=2, dim=-1)
+    last_token = hidden[-1]
+    hidden_norm = F.normalize(hidden, p=2, dim=-1)
     last_norm = F.normalize(last_token.unsqueeze(0), p=2, dim=-1)
-    cos_scores = (text_norm * last_norm).sum(dim=-1)  # (num_text,)
+    cos_scores = (hidden_norm * last_norm).sum(dim=-1)
 
     _, topk_indices = torch.topk(cos_scores, k)
     return topk_indices
@@ -798,7 +606,7 @@ class SGDLoss(nn.Module):
         self.teacher_patch_size = getattr(args, 'teacher_patch_size', 28)
         self.student_patch_size = getattr(args, 'student_patch_size', 64)
         self.student_resize = getattr(args, 'student_resize', 1024)
-        self.grassman_vision_use_cluster = getattr(args, 'grassman_vision_use_cluster', True)
+        self.grassman_vision_use_topk = getattr(args, 'grassman_vision_use_topk', True)
         self.grassman_text_use_topk = getattr(args, 'grassman_text_use_topk', True)
         self.topk_text_ratio = getattr(args, 'topk_text_ratio', 0.3)
         self.knn_neighbors = getattr(args, 'knn_neighbors', 10)
@@ -1064,119 +872,73 @@ class SGDLoss(nn.Module):
         vision_dbg = debug["vision"]
         text_dbg = debug["text"]
 
-        # ===== Vision tokens =====
+        # ===== Vision tokens (spatial overlap mapping + optional top-k) =====
         if has_image and t_vision_hidden is not None and s_vision_hidden is not None:
             num_teacher_tokens = t_vision_hidden.size(0)
             num_student_tokens = s_vision_hidden.size(0)
             vision_dbg["teacher_tokens"] = int(num_teacher_tokens)
             vision_dbg["student_tokens"] = int(num_student_tokens)
-            vision_dbg["use_cluster"] = bool(self.grassman_vision_use_cluster)
 
-            if num_teacher_tokens >= 2:
-                if self.grassman_vision_use_cluster:
-                    teacher_patches_per_row = int(np.sqrt(num_teacher_tokens))
-                    cluster_labels = cluster_vision_tokens_hdbscan(
-                        t_vision_hidden,
-                        teacher_patches_per_row, self.teacher_patch_size,
-                        original_width, original_height,
-                        min_cluster_size=6,
-                        min_samples_dbscan=max(1, int(getattr(self.args, 'min_samples_dbscan_teacher', 8))),
-                    )
-                    labels_np = np.array(cluster_labels)
-                    unique_labels = [int(c) for c in np.unique(labels_np) if c >= 0]
-                    vision_dbg["dbscan_clusters"] = len(unique_labels)
-                    vision_dbg["noise_tokens"] = int((labels_np < 0).sum())
-                    vision_dbg["cluster_sizes"] = [
-                        int((labels_np == c).sum()) for c in unique_labels
-                    ]
-
-                    cluster_info = prepare_vision_cluster_info(cluster_labels, device)
-                    vision_dbg["valid_clusters"] = (
-                        int(cluster_info["num_clusters"]) if cluster_info is not None else 0
-                    )
-
-                    if cluster_info is None:
-                        vision_dbg["skip_reason"] = "no_valid_cluster_labels"
-                    elif cluster_info['num_clusters'] < 2:
-                        vision_dbg["skip_reason"] = "valid_clusters_lt_2"
-
-                    if cluster_info is not None and cluster_info['num_clusters'] >= 2:
-                        t_weights = compute_intra_cluster_attention_weights(t_vision_hidden, cluster_info)
-                        if t_weights is not None:
-                            h_t_v = compute_weighted_cluster_mean(t_vision_hidden, cluster_info, t_weights)
-                        vision_dbg["teacher_graph_nodes"] = (
-                            int(h_t_v.size(0)) if h_t_v is not None else None
-                        )
-
-                        student_mapping, _ = map_teacher_clusters_to_student(
-                            cluster_labels,
-                            teacher_patches_per_row, self.teacher_patch_size,
-                            int(np.sqrt(num_student_tokens)) if num_student_tokens > 0 else 0,
-                            self.student_patch_size,
-                            original_width, original_height,
-                            self.student_resize,
-                        )
-
-                        mapped_tokens = 0
-                        if student_mapping:
-                            s_token_indices_list, s_cluster_ids_list = [], []
-                            for cluster_id, student_indices in student_mapping.items():
-                                for s_idx in student_indices:
-                                    if s_idx < num_student_tokens:
-                                        s_token_indices_list.append(s_idx)
-                                        s_cluster_ids_list.append(cluster_id)
-                                        mapped_tokens += 1
-                            vision_dbg["mapped_student_tokens"] = mapped_tokens
-
-                            if s_token_indices_list:
-                                student_cluster_info = {
-                                    'token_indices': torch.tensor(s_token_indices_list, dtype=torch.long, device=device),
-                                    'cluster_ids': torch.tensor(s_cluster_ids_list, dtype=torch.long, device=device),
-                                    'num_clusters': cluster_info['num_clusters'],
-                                }
-                                s_weights = compute_intra_cluster_attention_weights(s_vision_hidden, student_cluster_info)
-                                if s_weights is not None:
-                                    h_s_v = compute_weighted_cluster_mean(s_vision_hidden, student_cluster_info, s_weights)
-                            else:
-                                vision_dbg["skip_reason"] = "no_mapped_student_tokens"
-                        else:
-                            vision_dbg["skip_reason"] = "empty_student_cluster_mapping"
-
-                        vision_dbg["student_graph_nodes"] = (
-                            int(h_s_v.size(0)) if h_s_v is not None else None
-                        )
+            if num_teacher_tokens >= 2 and num_student_tokens >= 1:
+                teacher_patches_per_row = int(np.sqrt(num_teacher_tokens))
+                student_patches_per_row = int(np.sqrt(num_student_tokens))
+                if student_patches_per_row <= 0:
+                    vision_dbg["skip_reason"] = "zero_student_vision_tokens"
                 else:
-                    teacher_patches_per_row = int(np.sqrt(num_teacher_tokens))
-                    student_patches_per_row = int(np.sqrt(num_student_tokens)) if num_student_tokens > 0 else 0
-                    if student_patches_per_row <= 0:
-                        vision_dbg["skip_reason"] = "zero_student_vision_tokens"
-                    else:
-                        student_indices = map_teacher_tokens_to_student(
-                            num_teacher_tokens,
-                            teacher_patches_per_row,
-                            self.teacher_patch_size,
-                            student_patches_per_row,
-                            self.student_patch_size,
-                            original_width,
-                            original_height,
-                            num_student_tokens,
-                            self.student_resize,
-                        )
-                        student_idx_tensor = torch.tensor(student_indices, dtype=torch.long, device=device)
-                        h_t_v = t_vision_hidden
-                        h_s_v = s_vision_hidden[student_idx_tensor]
-                        vision_dbg["graph_nodes"] = int(h_t_v.size(0))
-                        vision_dbg["teacher_graph_nodes"] = int(h_t_v.size(0))
-                        vision_dbg["student_graph_nodes"] = int(h_s_v.size(0))
+                    t_aligned, s_aligned, spatial_debug = align_student_vision_to_teacher_spatial(
+                        t_vision_hidden,
+                        s_vision_hidden,
+                        teacher_patches_per_row,
+                        self.teacher_patch_size,
+                        student_patches_per_row,
+                        self.student_patch_size,
+                        original_width,
+                        original_height,
+                        self.student_resize,
+                    )
+                    for key in (
+                        "mapped_teacher_tokens",
+                        "student_tokens_used",
+                        "teacher_vision_tokens",
+                        "student_vision_tokens",
+                    ):
+                        if key in spatial_debug:
+                            vision_dbg[key] = spatial_debug[key]
 
-                if h_t_v is None or h_s_v is None:
-                    if "skip_reason" not in vision_dbg:
-                        vision_dbg["skip_reason"] = "missing_vision_representations"
-                elif h_t_v.size(0) != h_s_v.size(0):
-                    vision_dbg["skip_reason"] = "teacher_student_node_count_mismatch"
-                    h_t_v = h_s_v = None
-            else:
+                    if t_aligned is None or s_aligned is None:
+                        vision_dbg["skip_reason"] = spatial_debug.get(
+                            "skip_reason", "spatial_align_failed",
+                        )
+                    elif t_aligned.size(0) < 2:
+                        vision_dbg["skip_reason"] = "mapped_teacher_tokens_lt_2"
+                    else:
+                        vision_dbg["teacher_graph_nodes"] = int(t_aligned.size(0))
+                        vision_dbg["student_graph_nodes"] = int(s_aligned.size(0))
+                        vision_dbg["use_topk"] = bool(self.grassman_vision_use_topk)
+
+                        if self.grassman_vision_use_topk:
+                            topk_indices = select_topk_tokens_by_last_token_cosine(
+                                t_aligned, self.topk_text_ratio,
+                            )
+                            h_t_v = t_aligned[topk_indices]
+                            h_s_v = s_aligned[topk_indices]
+                            vision_dbg["topk_tokens"] = int(h_t_v.size(0))
+                        else:
+                            h_t_v = t_aligned
+                            h_s_v = s_aligned
+                            vision_dbg["graph_nodes"] = int(h_t_v.size(0))
+
+                        if h_t_v.size(0) < 2:
+                            vision_dbg["skip_reason"] = "vision_nodes_lt_2_after_topk"
+                            h_t_v = h_s_v = None
+            elif num_teacher_tokens < 2:
                 vision_dbg["skip_reason"] = "teacher_vision_tokens_lt_2"
+            else:
+                vision_dbg["skip_reason"] = "zero_student_vision_tokens"
+
+            if h_t_v is not None and h_s_v is not None and h_t_v.size(0) != h_s_v.size(0):
+                vision_dbg["skip_reason"] = "teacher_student_node_count_mismatch"
+                h_t_v = h_s_v = None
         elif has_image:
             vision_dbg["skip_reason"] = "missing_vision_hidden_states"
 
@@ -1190,7 +952,7 @@ class SGDLoss(nn.Module):
         if num_text > 0 and t_text_hidden is not None and s_text_hidden is not None:
             text_dbg["use_topk"] = bool(self.grassman_text_use_topk)
             if self.grassman_text_use_topk:
-                topk_indices = select_topk_text_tokens_by_last_token_cosine(
+                topk_indices = select_topk_tokens_by_last_token_cosine(
                     t_text_hidden, self.topk_text_ratio,
                 )
                 h_t_t = t_text_hidden[topk_indices]
