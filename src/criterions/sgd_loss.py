@@ -554,7 +554,7 @@ def compute_grassman_loss(espace_teacher, espace_student):
         return torch.tensor(0.0, device=device)
     if espace_teacher.shape != espace_student.shape:
         return torch.tensor(0.0, device=espace_teacher.device)
-    return ((espace_teacher.detach() - espace_student) ** 2).sum()
+    return ((espace_teacher.detach() - espace_student) ** 2).mean()
 
 
 def local_cross_affinity_loss(
@@ -783,7 +783,10 @@ class SGDLoss(nn.Module):
                 cross_dbg["skip_reason"] = "total_nodes_lt_3"
         else:
             if not valid_v or not valid_t:
-                cross_dbg["skip_reason"] = "vision_or_text_loss_invalid"
+                if vision_dbg.get("skip_reason") == "no_image":
+                    cross_dbg["skip_reason"] = "no_image"
+                else:
+                    cross_dbg["skip_reason"] = "vision_or_text_loss_invalid"
             elif h_t_v is None or h_t_t is None:
                 cross_dbg["skip_reason"] = "missing_modal_representations"
             else:
@@ -885,6 +888,8 @@ class SGDLoss(nn.Module):
                 h_t_v = h_s_v = None
         elif has_image:
             vision_dbg["skip_reason"] = "missing_vision_hidden_states"
+        else:
+            vision_dbg["skip_reason"] = "no_image"
 
         vision_dbg["vision_reps_valid"] = (
             h_t_v is not None and h_s_v is not None and h_t_v.size(0) == h_s_v.size(0)
@@ -1218,11 +1223,14 @@ class SGDLoss(nn.Module):
             + self.w_loss_cross * token_level_loss_cross
         )
         local_cross_loss = self._average_losses(local_cross_losses, device)
-        debug_session.set_batch_node_stats(
-            compute_batch_avg_node_stats(
-                vision_node_sum, vision_node_count, text_node_sum, text_node_count,
-            )
+        batch_node_stats = compute_batch_avg_node_stats(
+            vision_node_sum, vision_node_count, text_node_sum, text_node_count,
         )
+        batch_node_stats["valid_vision_samples"] = float(valid_vision_samples)
+        batch_node_stats["valid_text_samples"] = float(valid_text_samples)
+        batch_node_stats["valid_cross_modal_samples"] = float(valid_cross_modal_samples)
+        batch_node_stats["valid_sample_sides"] = float(2 * batch_size)
+        debug_session.set_batch_node_stats(batch_node_stats)
         return (
             token_level_loss,
             token_level_loss_v,

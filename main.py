@@ -66,6 +66,10 @@ KD_LOSS_METRIC_KEYS: Dict[str, Tuple[str, ...]] = {
         "avg_vision_nodes_pos",
         "avg_text_nodes_qry",
         "avg_text_nodes_pos",
+        "valid_vision_samples",
+        "valid_text_samples",
+        "valid_cross_modal_samples",
+        "valid_sample_sides",
     ),
     "span_propose": (
         "loss",

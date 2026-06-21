@@ -266,6 +266,12 @@ def build_sgd_loss_dict(
         "avg_vision_nodes_pos": metric_tensor(device, batch_node_stats.get("avg_vision_nodes_pos", 0.0)),
         "avg_text_nodes_qry": metric_tensor(device, batch_node_stats.get("avg_text_nodes_qry", 0.0)),
         "avg_text_nodes_pos": metric_tensor(device, batch_node_stats.get("avg_text_nodes_pos", 0.0)),
+        "valid_vision_samples": metric_tensor(device, batch_node_stats.get("valid_vision_samples", 0.0)),
+        "valid_text_samples": metric_tensor(device, batch_node_stats.get("valid_text_samples", 0.0)),
+        "valid_cross_modal_samples": metric_tensor(
+            device, batch_node_stats.get("valid_cross_modal_samples", 0.0),
+        ),
+        "valid_sample_sides": metric_tensor(device, batch_node_stats.get("valid_sample_sides", 0.0)),
     }
 
 
@@ -286,7 +292,21 @@ def _split_grassman_debug_entries(grassman_debug: list):
     return sample_spectral, other
 
 
+def _expected_no_image_skip(entry: dict) -> bool:
+    """Positives in MMEB are usually text-only; missing vision there is expected."""
+    if entry.get("has_image"):
+        return False
+    vision = entry.get("vision") or {}
+    cross = entry.get("cross") or {}
+    return (
+        vision.get("skip_reason") in ("no_image", "missing_vision_representations")
+        and cross.get("skip_reason") in (None, "no_image", "vision_or_text_loss_invalid")
+    )
+
+
 def _sample_spectral_debug_has_warning(entry: dict) -> bool:
+    if _expected_no_image_skip(entry):
+        return False
     if sample_extraction_needs_warning(entry):
         return True
     vision = entry.get("vision") or {}
@@ -301,7 +321,8 @@ def _sample_spectral_debug_has_warning(entry: dict) -> bool:
     if cross.get("total_nodes", 0) >= 3 and not cross.get("cross_loss_valid", False):
         return True
     for section in (vision, text, cross):
-        if section.get("skip_reason"):
+        skip = section.get("skip_reason")
+        if skip and skip != "no_image":
             return True
     return False
 
