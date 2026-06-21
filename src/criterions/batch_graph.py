@@ -12,6 +12,30 @@ from sklearn.cluster import DBSCAN
 LaplacianType = Literal["unnormalized", "normalized"]
 LAPLACIAN_TYPES = ("unnormalized", "normalized")
 
+# region agent log
+_AGENT_DEBUG_LOG = "/workspace/VLM_Embed/.cursor/debug-ad6d2b.log"
+_AGENT_DEBUG_SESSION = "ad6d2b"
+_agent_debug_step = 0
+
+
+def _agent_debug(hypothesis_id: str, location: str, message: str, data: dict, run_id: str = "verify-cmrd-on") -> None:
+    import json
+    import time
+
+    payload = {
+        "sessionId": _AGENT_DEBUG_SESSION,
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+        "runId": run_id,
+    }
+    with open(_AGENT_DEBUG_LOG, "a", encoding="utf-8") as f:
+        f.write(json.dumps(payload) + "\n")
+
+
+# endregion
 
 def pairwise_sq_dist(x: torch.Tensor) -> torch.Tensor:
     """Squared Euclidean distance matrix for row vectors in x. Shape: (N, N)."""
@@ -271,11 +295,38 @@ class VisualClusterAlignment:
     student_cluster_info: Dict
 
 
-def infer_square_grid(num_tokens: int) -> int:
+def infer_vision_grid(num_tokens: int) -> Optional[Tuple[int, int]]:
+    """Return (num_rows, num_cols) with num_rows * num_cols == num_tokens.
+
+    Prefers near-square layouts. Qwen2-VL teachers often emit non-square token counts
+    (e.g. 15 = 3x5), so a strict square assumption is invalid.
+    """
+    if num_tokens <= 0:
+        return None
+
     side = int(round(num_tokens ** 0.5))
-    if side * side != num_tokens:
+    if side * side == num_tokens:
+        return side, side
+
+    best: Optional[Tuple[int, int]] = None
+    for rows in range(1, int(num_tokens ** 0.5) + 1):
+        if num_tokens % rows != 0:
+            continue
+        cols = num_tokens // rows
+        if best is None or abs(rows - cols) < abs(best[0] - best[1]):
+            best = (rows, cols)
+    return best
+
+
+def infer_square_grid(num_tokens: int) -> int:
+    """Return patches-per-row for a square vision grid, or raise if not square."""
+    grid = infer_vision_grid(num_tokens)
+    if grid is None:
+        raise ValueError(f"Invalid vision token count: num_tokens={num_tokens}")
+    rows, cols = grid
+    if rows != cols:
         raise ValueError(f"Expected square vision grid, got num_tokens={num_tokens}")
-    return side
+    return cols
 
 
 def get_patch_coordinates(
@@ -572,8 +623,13 @@ def align_visual_clusters(
     n_teacher = teacher_vision_hidden.size(0)
     n_student = student_vision_hidden.size(0)
 
-    teacher_ppr = infer_square_grid(n_teacher)
-    student_ppr = infer_square_grid(n_student)
+    teacher_grid = infer_vision_grid(n_teacher)
+    student_grid = infer_vision_grid(n_student)
+    if teacher_grid is None or student_grid is None:
+        return None
+
+    teacher_ppr = teacher_grid[1]
+    student_ppr = student_grid[1]
 
     cluster_labels = cluster_vision_tokens_dbscan(
         teacher_vision_hidden,
@@ -801,6 +857,7 @@ def align_semantic_tokens_to_hidden(
 def build_student_anchored_overlap_matrix(
     student_offsets: torch.Tensor,
     teacher_offsets: torch.Tensor,
+    dtype: Optional[torch.dtype] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Build row-stochastic overlap matrix A (N_S, N_T) and valid student row mask."""
     s0 = student_offsets[:, 0:1].float()
@@ -813,6 +870,8 @@ def build_student_anchored_overlap_matrix(
     valid = row_sum > 0
     a = overlap / row_sum.clamp(min=1e-8).unsqueeze(1)
     a = a * valid.unsqueeze(1).float()
+    if dtype is not None:
+        a = a.to(dtype=dtype)
     return a, valid
 
 
@@ -897,7 +956,7 @@ def align_text_tokens(
     h_student, off_student = student_aligned
 
     overlap_matrix, valid_student = build_student_anchored_overlap_matrix(
-        off_student, off_teacher
+        off_student, off_teacher, dtype=h_teacher.dtype
     )
     if not valid_student.any():
         return None
@@ -1119,9 +1178,13 @@ def _count_text_tokens(input_ids: torch.Tensor) -> int:
 
 
 def _infer_image_size(num_vision_tokens: int, patch_size: int) -> Tuple[float, float]:
-    side = int(round(num_vision_tokens ** 0.5))
-    size = float(side * patch_size)
-    return size, size
+    grid = infer_vision_grid(num_vision_tokens)
+    if grid is None:
+        side = int(round(num_vision_tokens ** 0.5))
+        size = float(side * patch_size)
+        return size, size
+    rows, cols = grid
+    return float(cols * patch_size), float(rows * patch_size)
 
 
 def _zero_cmrd_output(ref: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -1137,6 +1200,11 @@ def _zero_cmrd_output(ref: torch.Tensor) -> Dict[str, torch.Tensor]:
         "avg_entropy_weight_v": zero,
         "avg_entropy_weight_t": zero,
     }
+
+
+def _zero_batch_output(ref: torch.Tensor) -> Dict[str, torch.Tensor]:
+    zero = ref.sum() * 0.0
+    return {"batch_level_loss": zero}
 
 
 class CMRDCriterion(nn.Module):
@@ -1275,6 +1343,8 @@ class CMRDCriterion(nn.Module):
         teacher_tokenizer,
         student_tokenizer,
     ) -> Dict[str, torch.Tensor]:
+        global _agent_debug_step
+        should_log = _agent_debug_step <= 3
         batch_size = student_qry_hs[-1].size(0)
 
         qry_texts = teacher_tokenizer.batch_decode(
@@ -1285,6 +1355,7 @@ class CMRDCriterion(nn.Module):
         )
 
         aligned_samples: List[Dict[str, torch.Tensor]] = []
+        attempted = 2 * batch_size
         for i in range(batch_size):
             for side, student_hs, teacher_hs, student_img, teacher_img, student_in, teacher_in, texts in (
                 ("qry", student_qry_hs, teacher_qry_hs, student_qry_image_features, teacher_qry_image_features,
@@ -1309,6 +1380,15 @@ class CMRDCriterion(nn.Module):
                     aligned_samples.append(sample)
 
         if not aligned_samples:
+            # region agent log
+            if should_log:
+                _agent_debug(
+                    "H1",
+                    "CMRDCriterion.forward",
+                    "cmrd_zero_no_aligned_samples",
+                    {"batch_size": batch_size, "attempted": attempted, "aligned_count": 0},
+                )
+            # endregion
             return _zero_cmrd_output(student_qry_hs[-1])
 
         (
@@ -1331,7 +1411,7 @@ class CMRDCriterion(nn.Module):
             text_mask=text_mask,
             return_dict=True,
         )
-        return {
+        result = {
             "cmrd_loss": out["loss"],
             "L_direct": out["L_direct"],
             "L_cycle": out["L_cycle"],
@@ -1342,6 +1422,30 @@ class CMRDCriterion(nn.Module):
             "avg_entropy_weight_v": out["avg_entropy_weight_v"],
             "avg_entropy_weight_t": out["avg_entropy_weight_t"],
         }
+        # region agent log
+        if should_log:
+            loss_f = float(out["loss"].detach())
+            _agent_debug(
+                "H2,H3,H4,H5",
+                "CMRDCriterion.forward:exit",
+                "cmrd_computed",
+                {
+                    "batch_size": batch_size,
+                    "attempted": attempted,
+                    "aligned_count": len(aligned_samples),
+                    "max_rv": int(student_visual.size(1)),
+                    "max_rt": int(student_text.size(1)),
+                    "cmrd_loss": loss_f,
+                    "L_direct": float(out["L_direct"].detach()),
+                    "L_cycle": float(out["L_cycle"].detach()),
+                    "loss_finite": bool(torch.isfinite(out["loss"]).all()),
+                    "loss_nonzero": loss_f != 0.0,
+                    "student_visual_dtype": str(student_visual.dtype),
+                    "teacher_text_dtype": str(teacher_text.dtype),
+                },
+            )
+        # endregion
+        return result
 
 
 def compute_contrastive_loss(
@@ -1454,6 +1558,10 @@ class TotalLossCriterion(nn.Module):
         if tokenizer is None:
             raise ValueError("TotalLossCriterion requires teacher tokenizer")
 
+        global _agent_debug_step
+        _agent_debug_step += 1
+        should_log = _agent_debug_step <= 3
+
         student_model = distiller.student
         teacher_model = distiller.teacher
         student_input_qry = input_data["student_inputs"]["qry"]
@@ -1461,14 +1569,39 @@ class TotalLossCriterion(nn.Module):
         teacher_input_qry = input_data["teacher_inputs"]["qry"]
         teacher_input_pos = input_data["teacher_inputs"]["pos"]
 
-        with torch.no_grad():
-            teacher_model.eval()
-            teacher_qry_reps, teacher_qry_image_features, _, teacher_qry_hs = teacher_model.encode_input(
-                teacher_input_qry
+        use_batch = self.w_loss_batch != 0
+        use_cmrd = self.w_cmrd_loss != 0
+        use_teacher = use_batch or use_cmrd
+
+        # region agent log
+        if should_log:
+            _agent_debug(
+                "H1",
+                "TotalLossCriterion.forward:entry",
+                "branch_flags",
+                {
+                    "step": _agent_debug_step,
+                    "w_loss_batch": float(self.w_loss_batch),
+                    "w_cmrd_loss": float(self.w_cmrd_loss),
+                    "use_batch": use_batch,
+                    "use_cmrd": use_cmrd,
+                    "use_teacher": use_teacher,
+                },
             )
-            teacher_pos_reps, teacher_pos_image_features, _, teacher_pos_hs = teacher_model.encode_input(
-                teacher_input_pos
-            )
+        # endregion
+
+        if use_teacher:
+            with torch.no_grad():
+                teacher_model.eval()
+                teacher_qry_reps, teacher_qry_image_features, _, teacher_qry_hs = teacher_model.encode_input(
+                    teacher_input_qry
+                )
+                teacher_pos_reps, teacher_pos_image_features, _, teacher_pos_hs = teacher_model.encode_input(
+                    teacher_input_pos
+                )
+        else:
+            teacher_qry_image_features = teacher_pos_image_features = None
+            teacher_qry_hs = teacher_pos_hs = None
 
         student_qry_reps, student_qry_image_features, _, student_qry_hs = student_model.encode_input(
             student_input_qry
@@ -1486,46 +1619,94 @@ class TotalLossCriterion(nn.Module):
             dist_gather_fn,
         )
 
-        batch_out = self.batch_graph(
-            student_qry_hs=student_qry_hs,
-            student_pos_hs=student_pos_hs,
-            teacher_qry_hs=teacher_qry_hs,
-            teacher_pos_hs=teacher_pos_hs,
-            student_input_qry=student_input_qry,
-            student_input_pos=student_input_pos,
-            teacher_input_qry=teacher_input_qry,
-            teacher_input_pos=teacher_input_pos,
-            dist_gather_fn=dist_gather_fn,
-        )
+        if use_batch:
+            batch_out = self.batch_graph(
+                student_qry_hs=student_qry_hs,
+                student_pos_hs=student_pos_hs,
+                teacher_qry_hs=teacher_qry_hs,
+                teacher_pos_hs=teacher_pos_hs,
+                student_input_qry=student_input_qry,
+                student_input_pos=student_input_pos,
+                teacher_input_qry=teacher_input_qry,
+                teacher_input_pos=teacher_input_pos,
+                dist_gather_fn=dist_gather_fn,
+            )
+        else:
+            batch_out = _zero_batch_output(student_qry_hs[-1])
 
-        cmrd_out = self.cmrd(
-            student_qry_hs=student_qry_hs,
-            student_pos_hs=student_pos_hs,
-            teacher_qry_hs=teacher_qry_hs,
-            teacher_pos_hs=teacher_pos_hs,
-            student_qry_image_features=student_qry_image_features,
-            student_pos_image_features=student_pos_image_features,
-            teacher_qry_image_features=teacher_qry_image_features,
-            teacher_pos_image_features=teacher_pos_image_features,
-            student_input_qry=student_input_qry,
-            student_input_pos=student_input_pos,
-            teacher_input_qry=teacher_input_qry,
-            teacher_input_pos=teacher_input_pos,
-            teacher_tokenizer=tokenizer,
-            student_tokenizer=self._get_student_tokenizer(distiller),
-        )
+        if use_cmrd:
+            # region agent log
+            if should_log:
+                _agent_debug("H2", "TotalLossCriterion.forward", "cmrd_branch_taken", {"step": _agent_debug_step})
+            # endregion
+            cmrd_out = self.cmrd(
+                student_qry_hs=student_qry_hs,
+                student_pos_hs=student_pos_hs,
+                teacher_qry_hs=teacher_qry_hs,
+                teacher_pos_hs=teacher_pos_hs,
+                student_qry_image_features=student_qry_image_features,
+                student_pos_image_features=student_pos_image_features,
+                teacher_qry_image_features=teacher_qry_image_features,
+                teacher_pos_image_features=teacher_pos_image_features,
+                student_input_qry=student_input_qry,
+                student_input_pos=student_input_pos,
+                teacher_input_qry=teacher_input_qry,
+                teacher_input_pos=teacher_input_pos,
+                teacher_tokenizer=tokenizer,
+                student_tokenizer=self._get_student_tokenizer(distiller),
+            )
+        else:
+            # region agent log
+            if should_log:
+                _agent_debug("H2", "TotalLossCriterion.forward", "cmrd_branch_skipped", {"step": _agent_debug_step})
+            # endregion
+            cmrd_out = _zero_cmrd_output(student_qry_hs[-1])
 
         total_loss = (
             contrastive_loss
             + self.w_loss_batch * batch_out["batch_level_loss"]
             + self.w_cmrd_loss * cmrd_out["cmrd_loss"]
         )
-        return {
+
+        outputs = {
             "loss": total_loss,
             "contrastive_loss": contrastive_loss,
-            "batch_level_loss": batch_out["batch_level_loss"],
-            **cmrd_out,
         }
+        if use_batch:
+            outputs["batch_level_loss"] = batch_out["batch_level_loss"]
+        if use_cmrd:
+            outputs.update(cmrd_out)
+
+        # region agent log
+        if should_log:
+            cmrd_keys = [k for k in outputs if "cmrd" in k.lower() or k.startswith("L_")]
+            expected_total = (
+                float(contrastive_loss.detach())
+                + float(self.w_loss_batch) * float(batch_out["batch_level_loss"].detach())
+                + float(self.w_cmrd_loss) * float(cmrd_out["cmrd_loss"].detach())
+            )
+            _agent_debug(
+                "H3,H4,H6",
+                "TotalLossCriterion.forward:exit",
+                "loss_components",
+                {
+                    "step": _agent_debug_step,
+                    "use_cmrd": use_cmrd,
+                    "output_keys": sorted(outputs.keys()),
+                    "cmrd_keys_in_output": cmrd_keys,
+                    "contrastive_loss": float(contrastive_loss.detach()),
+                    "batch_level_loss": float(batch_out["batch_level_loss"].detach()),
+                    "cmrd_loss_value": float(cmrd_out["cmrd_loss"].detach()),
+                    "L_direct": float(cmrd_out.get("L_direct", cmrd_out["cmrd_loss"]).detach()) if use_cmrd else 0.0,
+                    "total_loss": float(total_loss.detach()),
+                    "expected_total": expected_total,
+                    "total_matches_expected": abs(float(total_loss.detach()) - expected_total) < 1e-3,
+                    "teacher_ran": use_teacher,
+                    "batch_ran": use_batch,
+                },
+            )
+        # endregion
+        return outputs
 
 
 class BatchGraphEigenspaceLoss(nn.Module):

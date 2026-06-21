@@ -613,7 +613,7 @@ def main():
         device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
     
     distiller = distiller.to(device)
-    find_unused = use_batch_graph_loss or model_args.projector_config_path is not None
+    find_unused = model_args.projector_config_path is not None
     if dist.is_initialized():
         distiller = DDP(
             distiller,
@@ -643,6 +643,14 @@ def main():
         logger.info(f"  Batch graph eigen k_max = {training_args.batch_graph_k_max}")
         logger.info(f"  Batch graph laplacian = {training_args.batch_graph_laplacian_type}")
         logger.info(f"  w_loss_batch = {training_args.w_loss_batch}")
+        logger.info(f"  w_cmrd_loss = {training_args.w_cmrd_loss}")
+        if use_batch_graph_loss:
+            if training_args.w_loss_batch == 0:
+                logger.info("  batch eigenspace distillation: DISABLED (w_loss_batch=0)")
+            if training_args.w_cmrd_loss == 0:
+                logger.info("  CMRD distillation: DISABLED (w_cmrd_loss=0)")
+            if training_args.w_loss_batch == 0 and training_args.w_cmrd_loss == 0:
+                logger.info("  Teacher forward skipped each step (contrastive-only mode)")
         logger.info(f"  Val split ratio = {data_args.val_split_ratio}")
         logger.info(f"  Eval step = {training_args.eval_steps}")
         logger.info(f"  Output dir = {training_args.output_dir}")

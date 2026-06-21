@@ -14,7 +14,7 @@ wget https://huggingface.co/datasets/TIGER-Lab/MMEB-eval/resolve/main/images.zip
 unzip images.zip -d eval_images/
 
 # Train
-bash scripts/cls/train_SGD_fastvlm.sh
+bash scripts/cls/train_fastvlm.sh
 
 
 

@@ -1,20 +1,16 @@
-from huggingface_hub import upload_folder
+from huggingface_hub import HfApi, create_repo, upload_folder
 
-# 🪪 Access token của bạn
 token = ""
+folder_path = "training/FastVLM_cls_r32_bs12_bg1.0_cmrd0.0/checkpoint-final"
+repo_id = "vohuutridung/FastVLM_cls_r32_bs12_bg1.0_cmrd0.0"
 
-# 📁 Thư mục bạn muốn upload (ví dụ: model, checkpoints, v.v.)
-folder_path = "/workspace/ComfyUI/models/gligen/VLM_Embed/training/no_deepspeed_propose_kd_weight/checkpoint-final"
+create_repo(repo_id, token=token, exist_ok=True)
 
-# 🏷️ Repo đã có sẵn trên Hugging Face
-repo_id = "vohuutridung/"
-
-# 🚀 Upload toàn bộ folder lên repo đó
 upload_folder(
     folder_path=folder_path,
     repo_id=repo_id,
     token=token,
-    path_in_repo="",     # thư mục gốc trong repo, có thể đổi ví dụ "models/"
+    path_in_repo="",
 )
 
-print("✅ Đã upload folder lên Hugging Face thành công!")
+print("✅ Uploaded folder to Hugging Face successfully!")

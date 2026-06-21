@@ -4,13 +4,14 @@
 NUM_GPUS_PER_NODE=1
 LORA_R=32
 LORA_A=64
-BATCH_SIZE=8
+BATCH_SIZE=12
 
 # TotalLossCriterion = contrastive + w_loss_batch * batch_graph + w_cmrd_loss * cmrd
 # (--kd_loss_type batch_graph maps to TotalLossCriterion)
 W_LOSS_BATCH=1.0
 W_CMRD_LOSS=0.0
 CMRD_ETA=0.5
+CMRD_TEMPERATURE=0.07
 
 BATCH_GRAPH_K=8
 BATCH_GRAPH_K_MIN=2

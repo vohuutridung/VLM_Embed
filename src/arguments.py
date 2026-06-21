@@ -88,7 +88,7 @@ class TrainingArguments(TrainingArguments):
     output_dir: str = field(default=None, metadata={"help": "directory for saving trained models"})
     resume_from: str = field(default="none", metadata={"help": "`auto` will detect if any previous checkpoints should be resumed. or specify specific step of the checkpoint."})
     project_name: str = field(
-        default="vlm_distillation_batch_graph",
+        default="vlm_distillation_batch_graph_v2",
         metadata={"help": "Weights & Biases project name (used when report_to includes wandb)"},
     )
     logging_steps: int = field(default=1, metadata={"help": "logging steps"})
@@ -136,9 +136,11 @@ class TrainingArguments(TrainingArguments):
     cmrd_eta: float = field(default=0.5, metadata={"help": "cycle loss weight inside CMRD loss"})
     cmrd_temperature: float = field(default=0.07, metadata={"help": "softmax temperature for CMRD conditional distributions"})
     wandb_api_key: str = field(
-        default="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", 
-        metadata={"help": "optional W&B API key"}
-    ),
+        default="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",
+        metadata={"help": "optional W&B API key"},
+    )
+
+
 @dataclass
 class MTEBArguments:
     device: str = field(default="cuda", metadata={"help": "use cuda for single GPU inference, if multiple GPUs are available it will use DP automatically"})
