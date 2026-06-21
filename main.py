@@ -49,6 +49,15 @@ KD_LOSS_METRIC_KEYS: Dict[str, Tuple[str, ...]] = {
         "loss",
         "contrastive_loss",
         "batch_level_loss",
+        "cmrd_loss",
+        "L_direct",
+        "L_cycle",
+        "L_vt",
+        "L_tv",
+        "L_vtv",
+        "L_tvt",
+        "avg_entropy_weight_v",
+        "avg_entropy_weight_t",
     ),
     "span_propose": (
         "loss",
@@ -121,7 +130,7 @@ def init_wandb(
     if api_key:
         wandb.login(key=api_key, relogin=True)
     wandb.init(
-        project=os.getenv("WANDB_PROJECT", "vlm_distillation"),
+        project=training_args.project_name,
         name=training_args.run_name or f"run-{int(time.time())}",
         config={
             "model_args": vars(model_args),
@@ -130,7 +139,10 @@ def init_wandb(
         },
         settings=wandb.Settings(console="off"),
     )
-    logger.info("W&B initialized (metrics only; console output disabled).")
+    logger.info(
+        "W&B initialized (project=%s; metrics only; console output disabled).",
+        training_args.project_name,
+    )
 
 
 def configure_student_params(distiller: Distiller, training_args: TrainingArguments) -> None:

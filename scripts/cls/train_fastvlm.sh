@@ -6,7 +6,12 @@ LORA_R=32
 LORA_A=64
 BATCH_SIZE=8
 
+# TotalLossCriterion = contrastive + w_loss_batch * batch_graph + w_cmrd_loss * cmrd
+# (--kd_loss_type batch_graph maps to TotalLossCriterion)
 W_LOSS_BATCH=1.0
+W_CMRD_LOSS=0.0
+CMRD_ETA=0.5
+
 BATCH_GRAPH_K=8
 BATCH_GRAPH_K_MIN=2
 BATCH_GRAPH_K_MAX=32
@@ -14,7 +19,7 @@ BATCH_GRAPH_LAPLACIAN="unnormalized"
 
 # Configs
 TRAIN_SCRIPT="main.py"
-EXP_NAME="FastVLM_cls_r${LORA_R}_bs${BATCH_SIZE}"
+EXP_NAME="FastVLM_cls_r${LORA_R}_bs${BATCH_SIZE}_bg${W_LOSS_BATCH}_cmrd${W_CMRD_LOSS}"
 USE_FULLSET=false
 
 echo "========================================================="
@@ -63,8 +68,10 @@ torchrun --standalone --nproc_per_node=$NUM_GPUS_PER_NODE $TRAIN_SCRIPT \
     --lr_scheduler_type "cosine" \
     --warmup_ratio 0.03 \
     --kd_loss_type "batch_graph" \
-    --kd_weight $KD_WEIGHT \
     --w_loss_batch $W_LOSS_BATCH \
+    --w_cmrd_loss $W_CMRD_LOSS \
+    --cmrd_eta $CMRD_ETA \
+    --cmrd_temperature $CMRD_TEMPERATURE \
     --batch_graph_k $BATCH_GRAPH_K \
     --batch_graph_k_min $BATCH_GRAPH_K_MIN \
     --batch_graph_k_max $BATCH_GRAPH_K_MAX \
