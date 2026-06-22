@@ -11,31 +11,11 @@ from sklearn.cluster import DBSCAN
 
 LaplacianType = Literal["unnormalized", "normalized"]
 LAPLACIAN_TYPES = ("unnormalized", "normalized")
+MASK_FILL_VALUE = -1e4
 
-# region agent log
-_AGENT_DEBUG_LOG = "/workspace/VLM_Embed/.cursor/debug-ad6d2b.log"
-_AGENT_DEBUG_SESSION = "ad6d2b"
-_agent_debug_step = 0
+QWEN_VISION_TOKEN_ID_MIN = 151643
+QWEN_VISION_TOKEN_ID_MAX = 151656
 
-
-def _agent_debug(hypothesis_id: str, location: str, message: str, data: dict, run_id: str = "verify-cmrd-on") -> None:
-    import json
-    import time
-
-    payload = {
-        "sessionId": _AGENT_DEBUG_SESSION,
-        "hypothesisId": hypothesis_id,
-        "location": location,
-        "message": message,
-        "data": data,
-        "timestamp": int(time.time() * 1000),
-        "runId": run_id,
-    }
-    with open(_AGENT_DEBUG_LOG, "a", encoding="utf-8") as f:
-        f.write(json.dumps(payload) + "\n")
-
-
-# endregion
 
 def pairwise_sq_dist(x: torch.Tensor) -> torch.Tensor:
     """Squared Euclidean distance matrix for row vectors in x. Shape: (N, N)."""
@@ -147,50 +127,6 @@ def select_num_eigen_by_eigengap(
     return search_lo + best_local
 
 
-def compute_eigenspace_projection(
-    x: torch.Tensor,
-    knn_k: int = 5,
-    k_min: int = 2,
-    k_max: int = 16,
-    t: Optional[float] = None,
-    skip_trivial: bool = True,
-    num_eigen: Optional[int] = None,
-    laplacian_type: LaplacianType = "unnormalized",
-) -> torch.Tensor:
-    """Laplacian eigenmap projection P = U U^T. Shape: (N, N).
-
-    When num_eigen is None, the number of eigenvectors is chosen by eigengap in [k_min, k_max].
-    When num_eigen is set, that fixed count is used (clamped to the feasible range).
-    """
-    n = x.size(0)
-    if n < 2:
-        return torch.zeros(n, n, device=x.device, dtype=x.dtype)
-
-    w = build_knn_heat_affinity(x, k=knn_k, t=t)
-    laplacian = laplacian_from_affinity(w, laplacian_type=laplacian_type)
-
-    eigenvalues, eigenvectors = torch.linalg.eigh(laplacian.float())
-    eigenvectors = eigenvectors.to(dtype=x.dtype)
-
-    start = 1 if skip_trivial else 0
-    max_available = n - start
-    if max_available <= 0:
-        return torch.zeros(n, n, device=x.device, dtype=x.dtype)
-
-    if num_eigen is None:
-        num_eigen = select_num_eigen_by_eigengap(
-            eigenvalues, k_min=k_min, k_max=k_max, skip_trivial=skip_trivial
-        )
-    else:
-        num_eigen = min(int(num_eigen), max_available)
-
-    if num_eigen <= 0:
-        return torch.zeros(n, n, device=x.device, dtype=x.dtype)
-
-    u = eigenvectors[:, start : start + num_eigen]
-    return u @ u.t()
-
-
 def compute_eigenspace_projection_with_k(
     x: torch.Tensor,
     knn_k: int = 5,
@@ -276,6 +212,40 @@ def batch_graph_eigenspace_loss(
     )
 
 
+class BatchGraphEigenspaceLoss(nn.Module):
+    """Batch-level Laplacian-eigenmap eigenspace distillation loss."""
+
+    def __init__(
+        self,
+        knn_k: int = 8,
+        k_min: int = 2,
+        k_max: int = 16,
+        t: Optional[float] = None,
+        laplacian_type: LaplacianType = "unnormalized",
+    ):
+        super().__init__()
+        self.knn_k = knn_k
+        self.k_min = k_min
+        self.k_max = k_max
+        self.t = t
+        self.laplacian_type = laplacian_type
+
+    def forward(
+        self,
+        teacher_repr: torch.Tensor,
+        student_repr: torch.Tensor,
+    ) -> torch.Tensor:
+        return batch_graph_eigenspace_loss(
+            teacher_repr,
+            student_repr,
+            knn_k=self.knn_k,
+            k_min=self.k_min,
+            k_max=self.k_max,
+            t=self.t,
+            laplacian_type=self.laplacian_type,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Visual cluster alignment utils (for CMRD — unified cluster representations)
 # ---------------------------------------------------------------------------
@@ -318,17 +288,6 @@ def infer_vision_grid(num_tokens: int) -> Optional[Tuple[int, int]]:
     return best
 
 
-def infer_square_grid(num_tokens: int) -> int:
-    """Return patches-per-row for a square vision grid, or raise if not square."""
-    grid = infer_vision_grid(num_tokens)
-    if grid is None:
-        raise ValueError(f"Invalid vision token count: num_tokens={num_tokens}")
-    rows, cols = grid
-    if rows != cols:
-        raise ValueError(f"Expected square vision grid, got num_tokens={num_tokens}")
-    return cols
-
-
 def get_patch_coordinates(
     patch_idx: int,
     num_patches_per_row: int,
@@ -354,11 +313,16 @@ def compute_vision_distance_matrix(
     hidden_norm = F.normalize(hidden_states, p=2, dim=-1)
     cosine_distance = 1.0 - hidden_norm @ hidden_norm.T
 
-    coords = []
-    for i in range(num_tokens):
-        x, y = get_patch_coordinates(i, num_patches_per_row, patch_size)
-        coords.append([x, y])
-    coords = torch.tensor(coords, dtype=torch.float, device=device)
+    token_idx = torch.arange(num_tokens, device=device)
+    rows = token_idx // num_patches_per_row
+    cols = token_idx % num_patches_per_row
+    coords = torch.stack(
+        (
+            cols.float() * patch_size + patch_size / 2.0,
+            rows.float() * patch_size + patch_size / 2.0,
+        ),
+        dim=-1,
+    )
 
     diff = coords.unsqueeze(0) - coords.unsqueeze(1)
     spatial_distance = torch.sqrt((diff ** 2).sum(dim=-1) + 1e-8)
@@ -695,9 +659,6 @@ def align_visual_clusters(
 # Text token alignment utils (student-anchored overlap for CMRD)
 # ---------------------------------------------------------------------------
 
-QWEN_VISION_TOKEN_ID_MIN = 151643
-QWEN_VISION_TOKEN_ID_MAX = 151656
-
 
 def _all_placeholder_strings() -> Set[str]:
     from src.model.processor import VLM_IMAGE_TOKENS, VLM_VIDEO_TOKENS
@@ -829,18 +790,13 @@ def align_semantic_tokens_to_hidden(
     text_region_hidden: torch.Tensor,
     tokenizer,
     semantic_text: str,
-    non_semantic_ids: Set[int],
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     """Match standalone semantic tokenization to text-region hidden states."""
     sem_ids, sem_offsets = tokenize_semantic_with_offsets(tokenizer, semantic_text)
     if not sem_ids:
         return None
 
-    region_ids = [
-        int(tid)
-        for tid in text_region_input_ids.tolist()
-        if int(tid) not in non_semantic_ids
-    ]
+    region_ids = text_region_input_ids.tolist()
     if len(region_ids) != text_region_hidden.size(0):
         return None
 
@@ -940,14 +896,12 @@ def align_text_tokens(
         teacher_text_hidden,
         teacher_tokenizer,
         semantic_text,
-        teacher_non_sem,
     )
     student_aligned = align_semantic_tokens_to_hidden(
         student_text_ids,
         student_text_hidden,
         student_tokenizer,
         semantic_text,
-        student_non_sem,
     )
     if teacher_aligned is None or student_aligned is None:
         return None
@@ -1013,8 +967,6 @@ def align_text_tokens_from_hidden_states(
 # ---------------------------------------------------------------------------
 # CMRD loss core
 # ---------------------------------------------------------------------------
-
-MASK_FILL_VALUE = -1e4
 
 
 def rowwise_kl(
@@ -1343,10 +1295,7 @@ class CMRDCriterion(nn.Module):
         teacher_tokenizer,
         student_tokenizer,
     ) -> Dict[str, torch.Tensor]:
-        global _agent_debug_step
-        should_log = _agent_debug_step <= 3
         batch_size = student_qry_hs[-1].size(0)
-
         qry_texts = teacher_tokenizer.batch_decode(
             teacher_input_qry["input_ids"], skip_special_tokens=True
         )
@@ -1355,15 +1304,14 @@ class CMRDCriterion(nn.Module):
         )
 
         aligned_samples: List[Dict[str, torch.Tensor]] = []
-        attempted = 2 * batch_size
+        side_specs = (
+            (student_qry_hs, teacher_qry_hs, student_qry_image_features, teacher_qry_image_features,
+             student_input_qry, teacher_input_qry, qry_texts),
+            (student_pos_hs, teacher_pos_hs, student_pos_image_features, teacher_pos_image_features,
+             student_input_pos, teacher_input_pos, pos_texts),
+        )
         for i in range(batch_size):
-            for side, student_hs, teacher_hs, student_img, teacher_img, student_in, teacher_in, texts in (
-                ("qry", student_qry_hs, teacher_qry_hs, student_qry_image_features, teacher_qry_image_features,
-                 student_input_qry, teacher_input_qry, qry_texts),
-                ("pos", student_pos_hs, teacher_pos_hs, student_pos_image_features, teacher_pos_image_features,
-                 student_input_pos, teacher_input_pos, pos_texts),
-            ):
-                del side
+            for student_hs, teacher_hs, student_img, teacher_img, student_in, teacher_in, texts in side_specs:
                 sample = self._align_single(
                     student_hs=student_hs,
                     teacher_hs=teacher_hs,
@@ -1380,15 +1328,6 @@ class CMRDCriterion(nn.Module):
                     aligned_samples.append(sample)
 
         if not aligned_samples:
-            # region agent log
-            if should_log:
-                _agent_debug(
-                    "H1",
-                    "CMRDCriterion.forward",
-                    "cmrd_zero_no_aligned_samples",
-                    {"batch_size": batch_size, "attempted": attempted, "aligned_count": 0},
-                )
-            # endregion
             return _zero_cmrd_output(student_qry_hs[-1])
 
         (
@@ -1411,7 +1350,7 @@ class CMRDCriterion(nn.Module):
             text_mask=text_mask,
             return_dict=True,
         )
-        result = {
+        return {
             "cmrd_loss": out["loss"],
             "L_direct": out["L_direct"],
             "L_cycle": out["L_cycle"],
@@ -1422,30 +1361,6 @@ class CMRDCriterion(nn.Module):
             "avg_entropy_weight_v": out["avg_entropy_weight_v"],
             "avg_entropy_weight_t": out["avg_entropy_weight_t"],
         }
-        # region agent log
-        if should_log:
-            loss_f = float(out["loss"].detach())
-            _agent_debug(
-                "H2,H3,H4,H5",
-                "CMRDCriterion.forward:exit",
-                "cmrd_computed",
-                {
-                    "batch_size": batch_size,
-                    "attempted": attempted,
-                    "aligned_count": len(aligned_samples),
-                    "max_rv": int(student_visual.size(1)),
-                    "max_rt": int(student_text.size(1)),
-                    "cmrd_loss": loss_f,
-                    "L_direct": float(out["L_direct"].detach()),
-                    "L_cycle": float(out["L_cycle"].detach()),
-                    "loss_finite": bool(torch.isfinite(out["loss"]).all()),
-                    "loss_nonzero": loss_f != 0.0,
-                    "student_visual_dtype": str(student_visual.dtype),
-                    "teacher_text_dtype": str(teacher_text.dtype),
-                },
-            )
-        # endregion
-        return result
 
 
 def compute_contrastive_loss(
@@ -1558,10 +1473,6 @@ class TotalLossCriterion(nn.Module):
         if tokenizer is None:
             raise ValueError("TotalLossCriterion requires teacher tokenizer")
 
-        global _agent_debug_step
-        _agent_debug_step += 1
-        should_log = _agent_debug_step <= 3
-
         student_model = distiller.student
         teacher_model = distiller.teacher
         student_input_qry = input_data["student_inputs"]["qry"]
@@ -1573,30 +1484,13 @@ class TotalLossCriterion(nn.Module):
         use_cmrd = self.w_cmrd_loss != 0
         use_teacher = use_batch or use_cmrd
 
-        # region agent log
-        if should_log:
-            _agent_debug(
-                "H1",
-                "TotalLossCriterion.forward:entry",
-                "branch_flags",
-                {
-                    "step": _agent_debug_step,
-                    "w_loss_batch": float(self.w_loss_batch),
-                    "w_cmrd_loss": float(self.w_cmrd_loss),
-                    "use_batch": use_batch,
-                    "use_cmrd": use_cmrd,
-                    "use_teacher": use_teacher,
-                },
-            )
-        # endregion
-
         if use_teacher:
             with torch.no_grad():
                 teacher_model.eval()
-                teacher_qry_reps, teacher_qry_image_features, _, teacher_qry_hs = teacher_model.encode_input(
+                _, teacher_qry_image_features, _, teacher_qry_hs = teacher_model.encode_input(
                     teacher_input_qry
                 )
-                teacher_pos_reps, teacher_pos_image_features, _, teacher_pos_hs = teacher_model.encode_input(
+                _, teacher_pos_image_features, _, teacher_pos_hs = teacher_model.encode_input(
                     teacher_input_pos
                 )
         else:
@@ -1635,10 +1529,6 @@ class TotalLossCriterion(nn.Module):
             batch_out = _zero_batch_output(student_qry_hs[-1])
 
         if use_cmrd:
-            # region agent log
-            if should_log:
-                _agent_debug("H2", "TotalLossCriterion.forward", "cmrd_branch_taken", {"step": _agent_debug_step})
-            # endregion
             cmrd_out = self.cmrd(
                 student_qry_hs=student_qry_hs,
                 student_pos_hs=student_pos_hs,
@@ -1656,10 +1546,6 @@ class TotalLossCriterion(nn.Module):
                 student_tokenizer=self._get_student_tokenizer(distiller),
             )
         else:
-            # region agent log
-            if should_log:
-                _agent_debug("H2", "TotalLossCriterion.forward", "cmrd_branch_skipped", {"step": _agent_debug_step})
-            # endregion
             cmrd_out = _zero_cmrd_output(student_qry_hs[-1])
 
         total_loss = (
@@ -1676,71 +1562,7 @@ class TotalLossCriterion(nn.Module):
             outputs["batch_level_loss"] = batch_out["batch_level_loss"]
         if use_cmrd:
             outputs.update(cmrd_out)
-
-        # region agent log
-        if should_log:
-            cmrd_keys = [k for k in outputs if "cmrd" in k.lower() or k.startswith("L_")]
-            expected_total = (
-                float(contrastive_loss.detach())
-                + float(self.w_loss_batch) * float(batch_out["batch_level_loss"].detach())
-                + float(self.w_cmrd_loss) * float(cmrd_out["cmrd_loss"].detach())
-            )
-            _agent_debug(
-                "H3,H4,H6",
-                "TotalLossCriterion.forward:exit",
-                "loss_components",
-                {
-                    "step": _agent_debug_step,
-                    "use_cmrd": use_cmrd,
-                    "output_keys": sorted(outputs.keys()),
-                    "cmrd_keys_in_output": cmrd_keys,
-                    "contrastive_loss": float(contrastive_loss.detach()),
-                    "batch_level_loss": float(batch_out["batch_level_loss"].detach()),
-                    "cmrd_loss_value": float(cmrd_out["cmrd_loss"].detach()),
-                    "L_direct": float(cmrd_out.get("L_direct", cmrd_out["cmrd_loss"]).detach()) if use_cmrd else 0.0,
-                    "total_loss": float(total_loss.detach()),
-                    "expected_total": expected_total,
-                    "total_matches_expected": abs(float(total_loss.detach()) - expected_total) < 1e-3,
-                    "teacher_ran": use_teacher,
-                    "batch_ran": use_batch,
-                },
-            )
-        # endregion
         return outputs
-
-
-class BatchGraphEigenspaceLoss(nn.Module):
-    """Batch-level Laplacian-eigenmap eigenspace distillation loss."""
-
-    def __init__(
-        self,
-        knn_k: int = 8,
-        k_min: int = 2,
-        k_max: int = 16,
-        t: Optional[float] = None,
-        laplacian_type: LaplacianType = "unnormalized",
-    ):
-        super().__init__()
-        self.knn_k = knn_k
-        self.k_min = k_min
-        self.k_max = k_max
-        self.t = t
-        self.laplacian_type = laplacian_type
-
-    def forward(
-        self,
-        teacher_repr: torch.Tensor,
-        student_repr: torch.Tensor,
-    ) -> torch.Tensor:
-        return batch_graph_eigenspace_loss(
-            teacher_repr,
-            student_repr,
-            knn_k=self.knn_k,
-            k_min=self.k_min,
-            k_max=self.k_max,
-            t=self.t,
-            laplacian_type=self.laplacian_type,
-        )
 
 
 if __name__ == "__main__":
