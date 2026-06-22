@@ -11,14 +11,11 @@
 
 # GPU per node
 NUM_GPUS_PER_NODE=1
-LORA_R=64
-LORA_A=64
 BATCH_SIZE=16
-EXP_NAME="SGD_FastVLM_full_cls_r${LORA_R}_bs${BATCH_SIZE}"
 
 MODEL_PATH="${1:-training/${EXP_NAME}/checkpoint-final}"
 OUTPUT_DIR="${2:-eval_outputs/${EXP_NAME}}"
-USE_FULLSET=true
+USE_FULLSET=false
 
 echo "========================================================="
 echo "Starting Evaluation"
@@ -52,8 +49,6 @@ EVAL_ARGS=(
     --bf16
     --tgt_prefix_mod
     --lora True
-    --lora_r "${LORA_R}"
-    --lora_alpha "${LORA_A}"
 )
 
 if [ "$NUM_GPUS" -gt 1 ]; then

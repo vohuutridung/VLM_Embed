@@ -16,8 +16,17 @@ unzip images.zip -d eval_images/
 # Train
 bash scripts/cls/train_fastvlm.sh
 
+# Eval
+bash scripts/cls/eval.sh \
+    local_folder or hf_repo \
+    eval_outputs/model1
 
 
 
 
+bash scripts/cls/eval.sh \
+    vohuutridung/FastVLM_cls_r32_bs12_bg1.0_cmrd0.0 \
+    eval_outputs/model2
 
+
+vohuutridung/FastVLM_cls_r32_bs12_bg1.0_cmrd0.0

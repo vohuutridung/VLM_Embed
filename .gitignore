@@ -7,3 +7,5 @@ __pycache__
 vlm
 training/
 wandb/
+
+eval_outputs/
