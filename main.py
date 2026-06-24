@@ -43,7 +43,7 @@ def is_batch_graph_loss(training_args: TrainingArguments) -> bool:
     return training_args.kd_loss_type in BATCH_GRAPH_LOSS_TYPES
 
 
-# Full metric keys for logger / wandb (subset names without train/ prefix).
+# Full metric keys for logger / wandb.
 KD_LOSS_METRIC_KEYS: Dict[str, Tuple[str, ...]] = {
     "batch_graph": (
         "loss",
@@ -58,6 +58,21 @@ KD_LOSS_METRIC_KEYS: Dict[str, Tuple[str, ...]] = {
         "L_tvt",
         "avg_entropy_weight_v",
         "avg_entropy_weight_t",
+    ),
+    "trajectory": (
+        "loss",
+        "contrastive_loss",
+        "trajectory_loss",
+        "direct_loss",
+        "cycle_loss",
+        "vt_loss",
+        "tv_loss",
+        "vv_loss",
+        "tt_loss",
+        "teacher_entropy_v",
+        "teacher_entropy_t",
+        "rho_v",
+        "rho_t",
     ),
     "span_propose": (
         "loss",
@@ -638,19 +653,6 @@ def main():
         logger.info(f"  Num Epochs = {training_args.num_train_epochs}")
         logger.info(f"  Gradient Accumulation steps = {training_args.gradient_accumulation_steps}")
         logger.info(f"  Total optimization steps = {max_train_steps}")
-        logger.info(f"  Batch graph knn_k = {training_args.batch_graph_k}")
-        logger.info(f"  Batch graph eigen k_min = {training_args.batch_graph_k_min}")
-        logger.info(f"  Batch graph eigen k_max = {training_args.batch_graph_k_max}")
-        logger.info(f"  Batch graph laplacian = {training_args.batch_graph_laplacian_type}")
-        logger.info(f"  w_loss_batch = {training_args.w_loss_batch}")
-        logger.info(f"  w_cmrd_loss = {training_args.w_cmrd_loss}")
-        if use_batch_graph_loss:
-            if training_args.w_loss_batch == 0:
-                logger.info("  batch eigenspace distillation: DISABLED (w_loss_batch=0)")
-            if training_args.w_cmrd_loss == 0:
-                logger.info("  CMRD distillation: DISABLED (w_cmrd_loss=0)")
-            if training_args.w_loss_batch == 0 and training_args.w_cmrd_loss == 0:
-                logger.info("  Teacher forward skipped each step (contrastive-only mode)")
         logger.info(f"  Val split ratio = {data_args.val_split_ratio}")
         logger.info(f"  Eval step = {training_args.eval_steps}")
         logger.info(f"  Output dir = {training_args.output_dir}")

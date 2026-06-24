@@ -107,34 +107,90 @@ class TrainingArguments(TrainingArguments):
     kd_loss_type: str = field(default="contrastive_rkd", metadata={"help": "type of kd loss, current only support RKD"})
     ds_config: str = field(default=None, metadata={"help": "DeepSpeed config json file path"})
     deepspeed_config: str = field(default=None, metadata={"help": "DeepSpeed config json file path"})
-    # new args for span loss
+
+    # --- Layer mapping (shared across distillation criteria) ---
     teacher_layer_mapping: List[int] = field(
         default_factory=list,
-        metadata={"help": "List of teacher layers used for distillation; number of elements equals number of projectors"}
+        metadata={"help": "Teacher layer indices used for distillation (one per projector / trajectory layer)."},
     )
     student_layer_mapping: List[int] = field(
         default_factory=list,
-        metadata={"help": "List of student layers used for distillation; number of elements equals number of projectors"}
+        metadata={"help": "Student layer indices used for distillation (must match teacher_layer_mapping length)."},
     )
     split_layer_mapping: List[int] = field(
         default_factory=list,
         metadata={"help": "List of split layers for student; number of elements equals number of projectors"}   
     )
-    w_cross_modal_loss: float = field(default=1.0, metadata={"help": "weight for cross modal loss"})
-    min_samples_dbscan_teacher: int = field(default=2, metadata={"help": "min_samples for DBSCAN when clustering teacher features for span loss"})
-    # batch graph eigenspace distillation
-    w_loss_batch: float = field(default=1.0, metadata={"help": "weight for batch-level eigenspace distillation loss"})
-    batch_graph_k: int = field(default=8, metadata={"help": "kNN neighbors for Laplacian eigenmap graph"})
-    batch_graph_k_min: int = field(default=2, metadata={"help": "minimum number of eigenvectors selected by eigengap"})
-    batch_graph_k_max: int = field(default=16, metadata={"help": "maximum number of eigenvectors selected by eigengap"})
-    batch_graph_heat_t: Optional[float] = field(default=None, metadata={"help": "heat kernel bandwidth; None = auto from kNN distances"})
+
+    # --- Span-propose distillation (kd_loss_type: span_propose*) ---
+    w_cross_modal_loss: float = field(default=1.0, metadata={"help": "Weight for cross-modal span loss."})
+    min_samples_dbscan_teacher: int = field(
+        default=2,
+        metadata={"help": "min_samples for DBSCAN when clustering teacher vision tokens."},
+    )
+    teacher_patch_size: int = field(
+        default=28,
+        metadata={"help": "Teacher vision patch size (pixels) for token-count alignment."},
+    )
+    student_patch_size: int = field(
+        default=64,
+        metadata={"help": "Student vision patch size (pixels) for token-count alignment."},
+    )
+    student_resize: int = field(
+        default=1024,
+        metadata={"help": "Student image resize (pixels) used in visual token alignment."},
+    )
+
+    # --- Batch-graph eigenspace distillation (kd_loss_type: batch_graph) ---
+    w_loss_batch: float = field(default=1.0, metadata={"help": "Weight for batch-level eigenspace distillation loss."})
+    batch_graph_k: int = field(default=8, metadata={"help": "kNN neighbors for Laplacian eigenmap graph."})
+    batch_graph_k_min: int = field(default=2, metadata={"help": "Minimum eigenvectors selected by eigengap."})
+    batch_graph_k_max: int = field(default=16, metadata={"help": "Maximum eigenvectors selected by eigengap."})
+    batch_graph_heat_t: Optional[float] = field(
+        default=None,
+        metadata={"help": "Heat-kernel bandwidth; None = auto from kNN distances."},
+    )
     batch_graph_laplacian_type: str = field(
         default="unnormalized",
-        metadata={"help": "Laplacian type for batch graph: unnormalized (D-W) or normalized (I - D^{-1/2}WD^{-1/2})"},
+        metadata={"help": "Laplacian type: unnormalized (D-W) or normalized (I - D^{-1/2}WD^{-1/2})."},
     )
-    w_cmrd_loss: float = field(default=1.0, metadata={"help": "weight for CMRD cross-modal distillation loss"})
-    cmrd_eta: float = field(default=0.5, metadata={"help": "cycle loss weight inside CMRD loss"})
-    cmrd_temperature: float = field(default=0.07, metadata={"help": "softmax temperature for CMRD conditional distributions"})
+
+    # --- CMRD distillation (kd_loss_type: batch_graph) ---
+    w_cmrd_loss: float = field(default=1.0, metadata={"help": "Weight for CMRD cross-modal relational distillation."})
+    cmrd_eta: float = field(default=0.5, metadata={"help": "Cycle-loss weight inside CMRD."})
+    cmrd_temperature: float = field(default=0.07, metadata={"help": "Softmax temperature for CMRD conditional distributions."})
+
+    # --- Trajectory distillation (kd_loss_type: trajectory) ---
+    w_trajectory_loss: float = field(
+        default=1.0,
+        metadata={"help": "Global weight applied to TrajectoryLoss inside TotalLoss."},
+    )
+    trajectory_tau: float = field(
+        default=0.07,
+        metadata={"help": "Softmax temperature for visual↔text conditional distributions in TrajectoryLoss."},
+    )
+    trajectory_beta_direct: float = field(
+        default=1.0,
+        metadata={"help": "Weight of one-hop (direct) relation KL inside each TrajectoryLoss layer."},
+    )
+    trajectory_beta_cycle: float = field(
+        default=0.5,
+        metadata={"help": "Weight of two-hop (cycle) relation KL inside each TrajectoryLoss layer."},
+    )
+    trajectory_eps: float = field(
+        default=1e-8,
+        metadata={"help": "Numerical stability epsilon for probabilities and normalization in TrajectoryLoss."},
+    )
+    trajectory_eps_weight: float = field(
+        default=0.05,
+        metadata={"help": "Minimum teacher reliability floor rho = eps_weight + (1 - H_norm) * margin."},
+    )
+    trajectory_remove_self_in_cycle: bool = field(
+        default=True,
+        metadata={"help": "Zero diagonal and renormalize cycle transition matrices before cycle KL."},
+    )
+
+    # --- Logging ---
     wandb_api_key: str = field(
         default="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",
         metadata={"help": "optional W&B API key"},

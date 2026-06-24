@@ -6,21 +6,9 @@ LORA_R=32
 LORA_A=64
 BATCH_SIZE=12
 
-# TotalLossCriterion = contrastive + w_loss_batch * batch_graph + w_cmrd_loss * cmrd
-# (--kd_loss_type batch_graph maps to TotalLossCriterion)
-W_LOSS_BATCH=1.0
-W_CMRD_LOSS=0.0
-CMRD_ETA=0.5
-CMRD_TEMPERATURE=0.07
-
-BATCH_GRAPH_K=8
-BATCH_GRAPH_K_MIN=2
-BATCH_GRAPH_K_MAX=32
-BATCH_GRAPH_LAPLACIAN="unnormalized"
-
 # Configs
 TRAIN_SCRIPT="main.py"
-EXP_NAME="FastVLM_cls_r${LORA_R}_bs${BATCH_SIZE}_bg${W_LOSS_BATCH}_cmrd${W_CMRD_LOSS}"
+EXP_NAME="FastVLM_cls_entropy_r${LORA_R}_bs${BATCH_SIZE}_traj4"
 USE_FULLSET=false
 
 echo "========================================================="
@@ -35,10 +23,11 @@ else
     echo "Training with SINGLE dataset (ImageNet_1K)."
 fi
 
-
 torchrun --standalone --nproc_per_node=$NUM_GPUS_PER_NODE $TRAIN_SCRIPT \
     --model_name "apple/FastVLM-0.5B" \
     --teacher_model_name "raghavlite/B3_Qwen2_2B" \
+    --student_hidden_dim 896 \
+    --teacher_hidden_dim 1536 \
     --lora True \
     --teacher_lora True \
     --lora_r $LORA_R \
@@ -68,15 +57,12 @@ torchrun --standalone --nproc_per_node=$NUM_GPUS_PER_NODE $TRAIN_SCRIPT \
     --teacher_normalize True \
     --lr_scheduler_type "cosine" \
     --warmup_ratio 0.03 \
-    --kd_loss_type "batch_graph" \
-    --w_loss_batch $W_LOSS_BATCH \
-    --w_cmrd_loss $W_CMRD_LOSS \
-    --cmrd_eta $CMRD_ETA \
-    --cmrd_temperature $CMRD_TEMPERATURE \
-    --batch_graph_k $BATCH_GRAPH_K \
-    --batch_graph_k_min $BATCH_GRAPH_K_MIN \
-    --batch_graph_k_max $BATCH_GRAPH_K_MAX \
-    --batch_graph_laplacian_type $BATCH_GRAPH_LAPLACIAN \
+    --kd_loss_type "trajectory" \
+    --teacher_layer_mapping 0 22 25 28 \
+    --student_layer_mapping 0 18 21 24 \
+    --teacher_patch_size 28 \
+    --student_patch_size 64 \
+    --student_resize 1024 \
     --image_resolution "low" \
     --report_to "wandb" \
     --run_name "$EXP_NAME"
