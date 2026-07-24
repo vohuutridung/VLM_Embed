@@ -10,6 +10,7 @@ from .span_propose_attn import SpanProposeCriterionWeighted
 from .span_propose_attn_only_phrase import SpanProposeCriterionWeightedOnlyPhrase
 
 from .sgd_loss import SGDLoss
+from .segd_loss import SEGDLoss
 
 criterion_list = {
     "contrastive_rkd": ContrastiveLossWithRKD,
@@ -23,6 +24,7 @@ criterion_list = {
     "span_propose_attn": SpanProposeCriterionWeighted,
     "span_propose_attn_only_phrase": SpanProposeCriterionWeightedOnlyPhrase,
     "sgd_loss": SGDLoss,
+    "segd_loss": SEGDLoss,
 }
 
 def build_criterion(args):

@@ -48,6 +48,10 @@ def is_sgd_loss(training_args: TrainingArguments) -> bool:
     return training_args.kd_loss_type == "sgd_loss"
 
 
+def is_segd_loss(training_args: TrainingArguments) -> bool:
+    return training_args.kd_loss_type == "segd_loss"
+
+
 # Full metric keys for logger / wandb (subset names without train/ prefix).
 KD_LOSS_METRIC_KEYS: Dict[str, Tuple[str, ...]] = {
     "sgd_loss": (
@@ -63,6 +67,20 @@ KD_LOSS_METRIC_KEYS: Dict[str, Tuple[str, ...]] = {
         "batch_text_nodes_qry",
         "batch_vision_nodes_pos",
         "batch_text_nodes_pos",
+    ),
+    "segd_loss": (
+        "loss",
+        "contrastive_loss",
+        "cka_loss",
+        "segd_loss",
+        "segd_loss_qry",
+        "segd_loss_pos",
+        "batch_vision_nodes_qry",
+        "batch_text_nodes_qry",
+        "batch_vision_nodes_pos",
+        "batch_text_nodes_pos",
+        "sekd_valid_graphs_qry",
+        "sekd_valid_graphs_pos",
     ),
     "span_propose": (
         "loss",
@@ -508,6 +526,7 @@ def main():
     setup_logging(training_args, output_dir)
     nan_debug_dir = configure_nan_debug_logging(output_dir)
     use_sgd_loss = is_sgd_loss(training_args)
+    use_segd_loss = is_segd_loss(training_args)
     wandb_enabled = use_wandb(training_args)
 
     if wandb_enabled:
@@ -606,6 +625,7 @@ def main():
     if (
         model_args.projector_config_path is not None
         and not use_sgd_loss
+        and not use_segd_loss
         and hasattr(distiller, "add_optimizer_param_group")
     ):
         optimizer = distiller.add_optimizer_param_group(optimizer)
@@ -616,7 +636,7 @@ def main():
         device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
     
     distiller = distiller.to(device)
-    find_unused = use_sgd_loss or model_args.projector_config_path is not None
+    find_unused = use_sgd_loss or use_segd_loss or model_args.projector_config_path is not None
     if dist.is_initialized():
         distiller = DDP(
             distiller,

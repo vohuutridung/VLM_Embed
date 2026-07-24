@@ -147,6 +147,31 @@ class TrainingArguments(TrainingArguments):
         default=0.1,
         metadata={"help": "temperature for local cross-modal affinity softmax"},
     )
+    # SEKD / SEGDLoss
+    w_loss_cka: float = field(
+        default=1.0,
+        metadata={"help": "weight for batch-level CKA loss in SEGDLoss"},
+    )
+    sekd_k_min: int = field(
+        default=2,
+        metadata={"help": "minimum adaptive eigenmap dimension k_g for SEKD"},
+    )
+    sekd_k_max: int = field(
+        default=16,
+        metadata={"help": "maximum adaptive eigenmap dimension k_g for SEKD"},
+    )
+    sekd_eig_eps: float = field(
+        default=1e-6,
+        metadata={"help": "eigenvalue threshold for Laplacian nullity in SEKD"},
+    )
+    sekd_align_grid_h: int = field(
+        default=10,
+        metadata={"help": "shared vision eigenmap grid height (H0) for post-spectral alignment"},
+    )
+    sekd_align_grid_w: int = field(
+        default=10,
+        metadata={"help": "shared vision eigenmap grid width (W0) for post-spectral alignment"},
+    )
     wandb_api_key: str = field(
         default="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",
         metadata={"help": "Optional W&B API key for login (falls back to WANDB_API_KEY env or existing login)"},
