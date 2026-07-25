@@ -152,6 +152,13 @@ class TrainingArguments(TrainingArguments):
         default=1.0,
         metadata={"help": "weight for batch-level CKA loss in SEGDLoss"},
     )
+    cka_pooling: str = field(
+        default="last",
+        metadata={
+            "help": "Global embedding pooling for SEGDLoss CKA: "
+            "'mean' (masked mean over valid tokens) or 'last'/'eos' (last non-pad hidden)"
+        },
+    )
     sekd_k_min: int = field(
         default=2,
         metadata={"help": "minimum adaptive eigenmap dimension k_g for SEKD"},

@@ -8,6 +8,8 @@ Loss composition:
 
 SEKD runs per-sample (query / positive independently). Graphs are built on
 native tokens; modality-aware alignment is applied only after eigendecomposition.
+CKA uses batch-level linear CKA on global embeddings from the last hidden layer,
+with pooling controlled by ``--cka_pooling`` (``mean`` or ``last``/``eos``).
 Teacher spectral tensors are always detached — gradients flow only through the
 student QR / subspace path.
 """
@@ -66,6 +68,46 @@ class CKALoss(nn.Module):
         den1 = torch.norm(sh.t() @ sh, p="fro") + self.eps
         den2 = torch.norm(th.t() @ th, p="fro") + self.eps
         return (1.0 - num / torch.sqrt(den1 * den2)).to(student_h.dtype)
+
+
+def pool_global_embedding(
+    last_hidden_state: torch.Tensor,
+    attention_mask: torch.Tensor,
+    pooling: str = "last",
+    normalize: bool = False,
+    eps: float = _EPS,
+) -> torch.Tensor:
+    """
+    Pool last-layer sequence hidden states into one global vector per sample.
+
+    Supported modes (``cka_pooling``):
+      - ``last`` / ``eos``: hidden at the last non-padding position (same as MMEBModel._pooling)
+      - ``mean``: masked mean over all valid tokens (vision + text)
+    """
+    pooling = pooling.lower()
+    batch_size = last_hidden_state.shape[0]
+    device = last_hidden_state.device
+
+    if pooling in ("last", "eos"):
+        left_padding = attention_mask[:, -1].sum() == attention_mask.shape[0]
+        if left_padding:
+            reps = last_hidden_state[torch.arange(batch_size, device=device), -1, :]
+        else:
+            max_length = last_hidden_state.size(1)
+            num_padding = (attention_mask == 0).long().sum(dim=1)
+            last_idx = max_length - num_padding - 1
+            reps = last_hidden_state[torch.arange(batch_size, device=device), last_idx]
+    elif pooling == "mean":
+        mask = attention_mask.unsqueeze(-1).to(dtype=last_hidden_state.dtype)
+        reps = (last_hidden_state * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(eps)
+    else:
+        raise ValueError(
+            f"Unsupported cka_pooling={pooling!r}; choose 'mean', 'last', or 'eos'."
+        )
+
+    if normalize:
+        reps = F.normalize(reps, p=2, dim=-1)
+    return reps
 
 
 # ---------------------------------------------------------------------------
@@ -580,6 +622,11 @@ class SEGDLoss(nn.Module):
         self.args = args
         self.kd_weight = float(getattr(args, "kd_weight", 1.0))
         self.w_loss_cka = float(getattr(args, "w_loss_cka", 1.0))
+        self.cka_pooling = str(getattr(args, "cka_pooling", "last")).lower()
+        if self.cka_pooling not in ("mean", "last", "eos"):
+            raise ValueError(
+                f"cka_pooling must be 'mean', 'last', or 'eos', got {self.cka_pooling!r}"
+            )
         self.w_loss_v = float(getattr(args, "w_loss_v", 1.0))
         self.w_loss_t = float(getattr(args, "w_loss_t", 1.0))
         self.w_loss_cross = float(getattr(args, "w_loss_cross", 1.0))
@@ -616,6 +663,32 @@ class SEGDLoss(nn.Module):
     @staticmethod
     def _zero(device: torch.device, dtype: torch.dtype = torch.float32) -> torch.Tensor:
         return torch.zeros((), device=device, dtype=dtype)
+
+    def _cka_global_embeddings(
+        self,
+        student_hidden_states,
+        teacher_hidden_states,
+        student_input,
+        teacher_input,
+        student_normalize: bool,
+        teacher_normalize: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build per-sample global embeddings for batch-level CKA."""
+        s_last = student_hidden_states[-1]
+        t_last = teacher_hidden_states[-1]
+        student_reps = pool_global_embedding(
+            s_last,
+            student_input["attention_mask"],
+            pooling=self.cka_pooling,
+            normalize=student_normalize,
+        )
+        teacher_reps = pool_global_embedding(
+            t_last,
+            teacher_input["attention_mask"],
+            pooling=self.cka_pooling,
+            normalize=teacher_normalize,
+        ).detach()
+        return student_reps, teacher_reps
 
     def _sample_sekd_loss(
         self,
@@ -1024,9 +1097,27 @@ class SEGDLoss(nn.Module):
         target = target * (all_student_qry_reps.size(0) // all_student_pos_reps.size(0))
         contrastive_loss = nn.CrossEntropyLoss()(scores / distiller.temperature, target)
 
-        # ----- Batch-level CKA on pooled reps -----
-        cka_loss = self.cka(student_qry_reps, teacher_qry_reps.detach()) + self.cka(
-            student_pos_reps, teacher_pos_reps.detach(),
+        # ----- Batch-level CKA on global embeddings (mean / last hidden) -----
+        student_normalize = bool(getattr(distiller.model_args, "normalize", False))
+        teacher_normalize = bool(getattr(distiller.model_args, "teacher_normalize", False))
+        student_qry_cka, teacher_qry_cka = self._cka_global_embeddings(
+            student_qry_hidden_states,
+            teacher_qry_hidden_states,
+            student_qry_input,
+            teacher_qry_input,
+            student_normalize,
+            teacher_normalize,
+        )
+        student_pos_cka, teacher_pos_cka = self._cka_global_embeddings(
+            student_pos_hidden_states,
+            teacher_pos_hidden_states,
+            student_pos_input,
+            teacher_pos_input,
+            student_normalize,
+            teacher_normalize,
+        )
+        cka_loss = self.cka(student_qry_cka, teacher_qry_cka) + self.cka(
+            student_pos_cka, teacher_pos_cka,
         )
 
         # ----- SEKD (per-sample, post-spectral alignment) -----
