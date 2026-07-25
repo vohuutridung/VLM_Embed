@@ -153,7 +153,7 @@ def init_wandb(
     if api_key:
         wandb.login(key=api_key, relogin=True)
     wandb.init(
-        project=os.getenv("WANDB_PROJECT", "vlm_distillation"),
+        project=os.getenv("WANDB_PROJECT", "vlm_distillation_segd"),
         name=training_args.run_name or f"run-{int(time.time())}",
         config={
             "model_args": vars(model_args),
