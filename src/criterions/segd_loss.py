@@ -511,7 +511,8 @@ def align_text_eigenmap(
         return None
     if alignment.size(0) == 0:
         return None
-    return alignment @ eigenmap
+    # Spectral eigenmaps are computed in float32; alignment may use student dtype (e.g. bf16).
+    return alignment.to(dtype=eigenmap.dtype) @ eigenmap
 
 
 def align_bipartite_eigenmap(
@@ -532,8 +533,10 @@ def align_bipartite_eigenmap(
 
     e_v = eigenmap[:n_v]
     e_t = eigenmap[n_v:]
-    z_v = a_v @ e_v
-    z_t = a_t @ e_t
+    # Match alignment dtype to eigenmap (spectral path uses float32).
+    align_dtype = eigenmap.dtype
+    z_v = a_v.to(dtype=align_dtype) @ e_v
+    z_t = a_t.to(dtype=align_dtype) @ e_t
     return torch.cat([z_v, z_t], dim=0)
 
 
@@ -719,6 +722,8 @@ class SEGDLoss(nn.Module):
             else s_text.dtype if s_text is not None
             else torch.float32
         )
+        zero = self._zero(device, dtype)
+        zero_f = self._zero(device, torch.float32)
         stats = {
             "vision_nodes_t": float(t_vision.size(0)) if t_vision is not None else 0.0,
             "vision_nodes_s": float(s_vision.size(0)) if s_vision is not None else 0.0,
@@ -727,6 +732,9 @@ class SEGDLoss(nn.Module):
             "graph_v": 0.0,
             "graph_t": 0.0,
             "graph_vt": 0.0,
+            "loss_v": zero_f,
+            "loss_t": zero_f,
+            "loss_cross": zero_f,
         }
 
         losses: List[torch.Tensor] = []
@@ -775,6 +783,7 @@ class SEGDLoss(nn.Module):
                 losses.append(loss_v)
                 weights.append(self.w_loss_v)
                 stats["graph_v"] = 1.0
+                stats["loss_v"] = loss_v.float()
 
         # ===== G_t =====
         if (
@@ -798,6 +807,7 @@ class SEGDLoss(nn.Module):
                 losses.append(loss_t)
                 weights.append(self.w_loss_t)
                 stats["graph_t"] = 1.0
+                stats["loss_t"] = loss_t.float()
 
         # ===== G_vt =====
         if (
@@ -830,9 +840,10 @@ class SEGDLoss(nn.Module):
                     losses.append(loss_vt)
                     weights.append(self.w_loss_cross)
                     stats["graph_vt"] = 1.0
+                    stats["loss_cross"] = loss_vt.float()
 
         if not losses:
-            return self._zero(device, dtype), stats
+            return zero, stats
 
         w_sum = sum(weights)
         weighted = sum(w * l for w, l in zip(weights, losses)) / max(w_sum, _EPS)
@@ -980,16 +991,19 @@ class SEGDLoss(nn.Module):
         teacher_tokenizer,
         student_tokenizer,
         device: torch.device,
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+    ) -> Tuple[torch.Tensor, Dict[str, object]]:
         """Average SEKD over samples on one side (qry or pos). Always returns a tensor."""
         sample_losses: List[torch.Tensor] = []
+        sample_loss_v: List[torch.Tensor] = []
+        sample_loss_t: List[torch.Tensor] = []
+        sample_loss_cross: List[torch.Tensor] = []
         agg = {
             "vision_nodes": 0.0,
             "text_nodes": 0.0,
             "valid_samples": 0.0,
-            "graph_v": 0.0,
-            "graph_t": 0.0,
-            "graph_vt": 0.0,
+            "n_loss_v": 0.0,
+            "n_loss_t": 0.0,
+            "n_loss_cross": 0.0,
         }
 
         for i in range(batch_size):
@@ -1007,26 +1021,52 @@ class SEGDLoss(nn.Module):
             else:
                 sample_losses.append(loss_i * 0.0)
 
+            sample_loss_v.append(stats_i["loss_v"])
+            sample_loss_t.append(stats_i["loss_t"])
+            sample_loss_cross.append(stats_i["loss_cross"])
+            if stats_i["graph_v"] > 0:
+                agg["n_loss_v"] += 1.0
+            if stats_i["graph_t"] > 0:
+                agg["n_loss_t"] += 1.0
+            if stats_i["graph_vt"] > 0:
+                agg["n_loss_cross"] += 1.0
+
             agg["vision_nodes"] += stats_i["vision_nodes_s"]
             agg["text_nodes"] += stats_i["text_nodes_s"]
-            agg["graph_v"] += stats_i["graph_v"]
-            agg["graph_t"] += stats_i["graph_t"]
-            agg["graph_vt"] += stats_i["graph_vt"]
 
+        zero = self._zero(device)
         if not sample_losses:
-            return self._zero(device), agg
+            return zero, {
+                "avg_vision_nodes": 0.0,
+                "avg_text_nodes": 0.0,
+                "avg_vt_nodes": 0.0,
+                "loss_v": zero,
+                "loss_t": zero,
+                "loss_cross": zero,
+            }
 
-        # Mean over samples that had ≥1 valid graph; if none, mean of zeros.
         if agg["valid_samples"] > 0:
-            # Masked mean without data-dependent Python branching on rank collectives.
             stacked = torch.stack(sample_losses)
-            # valid mask from graphs — rebuild cheaply via loss identity with zeros
-            # Use equal weight over batch for DDP stability (invalid = 0 contribution
-            # already); scale by batch/valid so magnitude matches per-valid mean.
             loss = stacked.sum() / max(agg["valid_samples"], 1.0)
         else:
             loss = torch.stack(sample_losses).mean()
-        return loss, agg
+
+        def _mean_component(vals: List[torch.Tensor], n_valid: float) -> torch.Tensor:
+            stacked = torch.stack(vals)
+            if n_valid > 0:
+                return stacked.sum() / n_valid
+            return stacked.mean() * 0.0
+
+        avg_vision = agg["vision_nodes"] / max(batch_size, 1)
+        avg_text = agg["text_nodes"] / max(batch_size, 1)
+        return loss, {
+            "avg_vision_nodes": avg_vision,
+            "avg_text_nodes": avg_text,
+            "avg_vt_nodes": avg_vision + avg_text,
+            "loss_v": _mean_component(sample_loss_v, agg["n_loss_v"]),
+            "loss_t": _mean_component(sample_loss_t, agg["n_loss_t"]),
+            "loss_cross": _mean_component(sample_loss_cross, agg["n_loss_cross"]),
+        }
 
     def forward(self, distiller, input_data):
         student_model = distiller.student
@@ -1136,6 +1176,19 @@ class SEGDLoss(nn.Module):
             pos_image_sizes, teacher_tokenizer, student_tokenizer, device,
         )
         segd_loss = 0.5 * (segd_qry + segd_pos)
+        segd_loss_v = 0.5 * (stats_qry["loss_v"] + stats_pos["loss_v"])
+        segd_loss_t = 0.5 * (stats_qry["loss_t"] + stats_pos["loss_t"])
+        segd_loss_cross = 0.5 * (stats_qry["loss_cross"] + stats_pos["loss_cross"])
+
+        avg_vision_nodes = 0.5 * (
+            stats_qry["avg_vision_nodes"] + stats_pos["avg_vision_nodes"]
+        )
+        avg_text_nodes = 0.5 * (
+            stats_qry["avg_text_nodes"] + stats_pos["avg_text_nodes"]
+        )
+        avg_vt_nodes = 0.5 * (
+            stats_qry["avg_vt_nodes"] + stats_pos["avg_vt_nodes"]
+        )
 
         total_loss = (
             contrastive_loss
@@ -1148,19 +1201,13 @@ class SEGDLoss(nn.Module):
 
         return {
             "loss": total_loss,
-            "contrastive_loss": contrastive_loss,
-            "cka_loss": cka_loss,
-            "segd_loss": segd_loss,
-            "segd_loss_qry": segd_qry.detach(),
-            "segd_loss_pos": segd_pos.detach(),
-            "batch_vision_nodes_qry": _metric(stats_qry["vision_nodes"]),
-            "batch_text_nodes_qry": _metric(stats_qry["text_nodes"]),
-            "batch_vision_nodes_pos": _metric(stats_pos["vision_nodes"]),
-            "batch_text_nodes_pos": _metric(stats_pos["text_nodes"]),
-            "sekd_valid_graphs_qry": _metric(
-                stats_qry["graph_v"] + stats_qry["graph_t"] + stats_qry["graph_vt"]
-            ),
-            "sekd_valid_graphs_pos": _metric(
-                stats_pos["graph_v"] + stats_pos["graph_t"] + stats_pos["graph_vt"]
-            ),
+            "contrastive_loss": contrastive_loss.detach(),
+            "cka_loss": cka_loss.detach(),
+            "segd_loss": segd_loss.detach(),
+            "segd_loss_v": segd_loss_v.detach(),
+            "segd_loss_t": segd_loss_t.detach(),
+            "segd_loss_cross": segd_loss_cross.detach(),
+            "avg_vision_nodes": _metric(avg_vision_nodes),
+            "avg_text_nodes": _metric(avg_text_nodes),
+            "avg_vt_nodes": _metric(avg_vt_nodes),
         }

@@ -4,10 +4,10 @@
 NUM_GPUS_PER_NODE=1
 LORA_R=32
 LORA_A=64
-BATCH_SIZE=16
+BATCH_SIZE=8
 GRADIENT_ACCUMULATION_STEPS=1
 
-KD_WEIGHT=0.05
+KD_WEIGHT=1.0
 W_LOSS_CKA=1.0
 # CKA global embedding: "mean" | "last" | "eos"
 CKA_POOLING="last"
@@ -25,7 +25,7 @@ KNN_NEIGHBORS=10
 
 TRAIN_SCRIPT="main.py"
 EXP_NAME="SEGD_FastVLM_cls_r${LORA_R}_bs${BATCH_SIZE}_cka${CKA_POOLING}"
-USE_FULLSET=false
+USE_FULLSET=full
 
 echo "========================================================="
 echo "Starting SEGD Training (CKA pooling: ${CKA_POOLING})"
@@ -55,7 +55,7 @@ torchrun --standalone --nproc_per_node=$NUM_GPUS_PER_NODE $TRAIN_SCRIPT \
     --subset_name "${SUBSETS[@]}" \
     --dataset_split "original" \
     --image_dir "vlm2vec_train/MMEB-train" \
-    --percent_data 0.05 \
+    --percent_data 1.0 \
     --output_dir "training/$EXP_NAME" \
     --per_device_train_batch_size $BATCH_SIZE \
     --gradient_accumulation_steps $GRADIENT_ACCUMULATION_STEPS \
