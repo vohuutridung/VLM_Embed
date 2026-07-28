@@ -25,7 +25,7 @@ KNN_NEIGHBORS=10
 
 TRAIN_SCRIPT="main.py"
 EXP_NAME="SEGD_FastVLM_cls_r${LORA_R}_bs${BATCH_SIZE}_cka${CKA_POOLING}"
-USE_FULLSET=full
+USE_FULLSET=false
 
 echo "========================================================="
 echo "Starting SEGD Training (CKA pooling: ${CKA_POOLING})"
