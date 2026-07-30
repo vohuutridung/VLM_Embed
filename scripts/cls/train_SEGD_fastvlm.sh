@@ -14,6 +14,9 @@ CKA_POOLING="last"
 W_LOSS_V=1.0
 W_LOSS_T=0.7
 W_LOSS_CROSS=1.0
+# Semantic Grounding Distillation — direct KL on G_vt vision–text affinity
+W_LOSS_GROUNDING=0.5
+SEKD_GROUNDING_TEMP=0.1
 
 # SEKD hyperparameters
 SEKD_K_MIN=2
@@ -78,6 +81,8 @@ torchrun --standalone --nproc_per_node=$NUM_GPUS_PER_NODE $TRAIN_SCRIPT \
     --w_loss_v $W_LOSS_V \
     --w_loss_t $W_LOSS_T \
     --w_loss_cross $W_LOSS_CROSS \
+    --w_loss_grounding $W_LOSS_GROUNDING \
+    --sekd_grounding_temp $SEKD_GROUNDING_TEMP \
     --knn_neighbors $KNN_NEIGHBORS \
     --sekd_k_min $SEKD_K_MIN \
     --sekd_k_max $SEKD_K_MAX \

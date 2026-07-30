@@ -179,6 +179,18 @@ class TrainingArguments(TrainingArguments):
         default=10,
         metadata={"help": "shared vision eigenmap grid width (W0) for post-spectral alignment"},
     )
+    w_loss_grounding: float = field(
+        default=0.5,
+        metadata={"help": "weight for Semantic Grounding Distillation (KL on G_vt c_ij) in SEGDLoss"},
+    )
+    sekd_grounding_temp: float = field(
+        default=0.1,
+        metadata={"help": "softmax temperature tau_grounding for Semantic Grounding Distillation"},
+    )
+    sekd_grounding_bidirectional: bool = field(
+        default=True,
+        metadata={"help": "if True, average vision→text and text→vision KL in grounding loss"},
+    )
     wandb_api_key: str = field(
         default="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",
         metadata={"help": "Optional W&B API key for login (falls back to WANDB_API_KEY env or existing login)"},

@@ -9,9 +9,13 @@ python fix_lib.py
 # Download train_data (for cls only)
 bash scripts/cls/download_traindata_cls.sh
 
-# Download eval_data
-wget https://huggingface.co/datasets/TIGER-Lab/MMEB-eval/resolve/main/images.zip
+# Download eval_data (~7GB; faster than wget with hf_transfer)
+pip install hf_transfer
+export HF_HUB_ENABLE_HF_TRANSFER=1
+hf download TIGER-Lab/MMEB-eval images.zip --repo-type dataset --local-dir .
+mkdir -p eval_images
 unzip images.zip -d eval_images/
+# ImageNet-1K only: unzip images.zip "ImageNet-1K/*" -d eval_images/
 
 # Train
 bash scripts/cls/train_SGD_fastvlm.sh

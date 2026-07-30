@@ -1,7 +1,8 @@
 # SEGDLoss — Tổng quan loss (Multimodal Spectral Eigenspace Distillation)
 
 Tài liệu theo dõi cấu trúc loss hiện tại của [`src/criterions/segd_loss.py`](../src/criterions/segd_loss.py).  
-Phương pháp distillation phổ chính: **SEKD** (Spectral Eigenspace Knowledge Distillation), chạy **per-sample** trên native tokens; alignment chỉ sau phân tích phổ.
+Phương pháp distillation phổ chính: **SEKD** (Spectral Eigenspace Knowledge Distillation), chạy **per-sample** trên native tokens; alignment chỉ sau phân tích phổ.  
+Bổ sung **Semantic Grounding Distillation**: KL trên ma trận affinity vision–text **đã align** về lưới $H_0 \times W_0$ × shared words (song song SEKD, không thay thế).
 
 Script train mẫu: [`scripts/cls/train_SEGD_fastvlm.sh`](../scripts/cls/train_SEGD_fastvlm.sh)
 
@@ -13,6 +14,7 @@ Script train mẫu: [`scripts/cls/train_SEGD_fastvlm.sh`](../scripts/cls/train_S
 loss = contrastive_loss
      + kd_weight * segd_loss
      + kd_weight * w_loss_cka * cka_loss
+     + kd_weight * w_loss_grounding * grounding_loss
 ```
 
 | Thành phần | Trọng số mặc định | Mô tả ngắn |
@@ -20,6 +22,7 @@ loss = contrastive_loss
 | `contrastive_loss` | 1.0 (implicit) | InfoNCE trên pooled embedding student (query ↔ positive) |
 | `segd_loss` | `kd_weight` | SEKD: distillation phổ Laplacian per-sample (qry + pos) |
 | `cka_loss` | `kd_weight * w_loss_cka` | Linear CKA batch-level trên global embedding student ↔ teacher |
+| `grounding_loss` | `kd_weight * w_loss_grounding` | KL trên $C_{\mathrm{aligned}}$ (affinity $\mathcal{G}_{vt}$ sau align $A_v C A_t^{\top}$) |
 
 **Không có:** RKD, local cross-modal affinity, DBSCAN vision cluster, pre-alignment hidden states teacher→student.
 
@@ -50,6 +53,12 @@ flowchart TB
         SPEC["Spectral + align + QR loss"]
     end
 
+    subgraph sg_ground ["4. Semantic Grounding"]
+        CRAW["Gvt: L2-normalize -> C"]
+        ALIGN["C_aligned = A_v C A_t^T"]
+        KL["KL(p_teacher || p_student)"]
+    end
+
     TOTAL["Total loss"]
 
     SQ --> POOL_S --> INFO
@@ -57,10 +66,12 @@ flowchart TB
     TQ --> POOL_CKA --> CKA_NODE
     SQ --> TOK --> G3 --> SPEC
     TQ --> TOK
+    TOK --> CRAW --> ALIGN --> KL
 
     INFO --> TOTAL
     CKA_NODE --> TOTAL
     SPEC --> TOTAL
+    KL --> TOTAL
 ```
 
 ---
@@ -256,7 +267,11 @@ Từ hidden layer cuối, **không** cluster DBSCAN, **không** map teacher→st
 | Vision | `extract_vision_hidden_states` — toàn bộ patch tokens | idem |
 | Text | `extract_text_hidden_states` — toàn bộ subword tokens | idem |
 
-Text offsets (`build_paired_text_offsets`) chỉ dùng cho **post-spectral text alignment**, không ghép số token teacher = student.
+Text offsets (`build_paired_text_offsets`) và vision grid (`build_vision_alignment_operator`) dùng cho:
+- **Post-spectral text/vision alignment** (eigenmap $Z = AE$),
+- **Semantic Grounding** ($C_{\mathrm{aligned}} = A_v C A_t^{\top}$).
+
+Không ghép số token teacher = student trên hidden states.
 
 ### 3.2 Pipeline SEKD cho mỗi graph $g \in \{v,\, t,\, vt\}$
 
@@ -312,6 +327,8 @@ W =
 C^{\top} & 0
 \end{bmatrix}
 $$
+
+> **Lưu ý:** Cùng ma trận $C$ được tính sau bước normalize cũng là input cho **Semantic Grounding** (nhánh song song, align trước KL — xem §4). Nhánh spectral vẫn dùng $C$ thô để build $W$ và Laplacian.
 
 #### Bước 3 — Laplacian & eigendecomposition
 
@@ -403,17 +420,128 @@ $$
 
 Sample không có graph hợp lệ → đóng góp 0 (DDP-safe).
 
-**Metric log:** `segd_loss`, `segd_loss_qry`, `segd_loss_pos`
+**Metric log:** `segd_loss`, `segd_loss_qry`, `segd_loss_pos`, `sekd_mean_k_g`, `sekd_mean_k_g_qry`, `sekd_mean_k_g_pos`
 
 ---
 
-## 4. Ràng buộc gradient & DDP
+## 4. Semantic Grounding loss (`grounding_loss`)
+
+### Mục tiêu
+
+Bổ sung ràng buộc **trực tiếp** trên correspondence vision–text trong **không gian đã align** (lưới $H_0 \times W_0$ × shared words), ép phân phối softmax của student khớp teacher — bổ sung cho SEKD spectral, không thay thế.
+
+### Pipeline (trong block $\mathcal{G}_{vt}$)
+
+```mermaid
+flowchart LR
+    norm["L2-normalize h^v, h^t"]
+    cmat["C = relu_cosine(h^v, h^t)"]
+    branch_spec["SEKD spectral: W from C -> L -> eigh -> QR"]
+    av["A_v^T, A_v^S riêng"]
+    at["A_t^T, A_t^S shared-word rows"]
+    calign["C_aligned = A_v C A_t^T"]
+    kl["KL softmax rows"]
+
+    norm --> cmat
+    cmat --> branch_spec
+    cmat --> av --> calign
+    cmat --> at --> calign
+    calign --> kl
+```
+
+Hàm code: `align_bipartite_affinity_for_grounding(c, a_v, a_t)` → `semantic_grounding_kl_loss(...)`.
+
+### Vì sao cần align trước KL?
+
+Teacher (`patch_size=28`) và student (`patch_size=64`) có $N_v$, $N_t$ native khác nhau. KL trực tiếp trên $C_{ij}$ thô $[N_v, N_t]$ là **sai ngữ nghĩa** (hàng/cột index không tương ứng cùng vùng ảnh/từ). Giải pháp: tái dùng $A_v$, $A_t$ của post-spectral SEKD:
+
+$$
+C_{\mathrm{aligned}} = A_v \, C \, A_t^{\top}
+\quad\in\mathbb{R}^{(H_0 W_0)\times M}
+$$
+
+| Operator | Shape | Nguồn | Teacher / Student |
+|----------|-------|-------|-------------------|
+| $A_v$ | $[H_0 W_0,\, N_v]$ | `build_vision_alignment_operator` | **Riêng** (patch grid / $N_v$ khác) |
+| $A_t$ | $[M,\, N_t]$ | `build_joint_text_alignment_matrices` | **Riêng cột**, cùng $M$ shared-word rows |
+| $C$ | $[N_v,\, N_t]$ | `bipartite_relu_cosine_matrix` | Riêng native tokens |
+| $C_{\mathrm{aligned}}$ | $[H_0 W_0,\, M]$ | $A_v C A_t^{\top}$ | **Cùng shape** T/S trước KL |
+
+Ma trận $C$ gốc vẫn dùng **nguyên vẹn** cho nhánh spectral $\mathcal{G}_{vt}$ (Laplacian / eigh).
+
+### Input
+
+- $C$ từ $\mathcal{G}_{vt}$ sau L2-normalize (`bipartite_relu_cosine_matrix`); teacher $C$ tính trong `no_grad`.
+- $A_v$, $A_t$: geometry-only (không grad từ hidden).
+- Gradient student: $C_{\mathrm{aligned}}^{S} = A_v^{S}\, C^{S}\, (A_t^{S})^{\top}$ → softmax/KL.
+
+Trước KL, code kiểm tra `C_aligned_teacher.shape == C_aligned_student.shape` (`__debug__` assert; production trả 0 nếu lệch).
+
+### Điều kiện sample
+
+Cùng điều kiện tối thiểu block $\mathcal{G}_{vt}$ trong code:
+
+- Có ảnh (`has_image`), ≥ 1 vision token và ≥ 1 text token (teacher & student),
+- `a_t_teacher`, `a_t_student` hợp lệ (`build_joint_text_alignment_matrices`),
+- `a_v_teacher`, `a_v_student` build OK (`build_vision_alignment_operator`),
+- `w_loss_grounding > 0`.
+
+Sample không đủ điều kiện → đóng góp 0 (DDP-safe, giống SEKD).
+
+### Công thức
+
+Với mỗi hàng vision-grid $i$ (trên $C_{\mathrm{aligned}}$):
+
+$$
+p^{\mathrm{teacher}}_{i\cdot} = \mathrm{softmax}_j\!\left(\frac{C_{\mathrm{aligned},\, ij}^{\mathrm{teacher}}}{\tau_{\mathrm{ground}}}\right),
+\qquad
+p^{\mathrm{student}}_{i\cdot} = \mathrm{softmax}_j\!\left(\frac{C_{\mathrm{aligned},\, ij}^{\mathrm{student}}}{\tau_{\mathrm{ground}}}\right)
+$$
+
+$$
+\mathcal{L}^{\mathrm{sample}}_{\mathrm{ground}}
+= \mathrm{mean}_i\,
+\mathrm{KL}\!\left(p^{\mathrm{teacher}}_{i\cdot} \,\|\, p^{\mathrm{student}}_{i\cdot}\right)
+$$
+
+Nếu `--sekd_grounding_bidirectional True` (mặc định), thêm chiều text→vision trên $C_{\mathrm{aligned}}^{\top}$ rồi average.
+
+Tổng hợp query / positive:
+
+$$
+\mathcal{L}_{\mathrm{ground}}
+= \frac{1}{2}\left(\mathcal{L}^{\mathrm{qry}}_{\mathrm{ground}} + \mathcal{L}^{\mathrm{pos}}_{\mathrm{ground}}\right)
+$$
+
+### Hyperparameters
+
+| Arg | CLI | Default | Ý nghĩa |
+|-----|-----|---------|---------|
+| `w_loss_grounding` | `--w_loss_grounding` | `0.5` | Trọng số sau `kd_weight` |
+| `sekd_grounding_temp` | `--sekd_grounding_temp` | `0.1` | $\tau_{\mathrm{ground}}$ |
+| `sekd_grounding_bidirectional` | `--sekd_grounding_bidirectional` | `True` | KL hai chiều v↔t |
+
+### Metric log keys
+
+| Key | Ý nghĩa |
+|-----|---------|
+| `grounding_loss` | Tổng weighted (qry + pos) / 2 |
+| `grounding_loss_qry` | Side query (detached) |
+| `grounding_loss_pos` | Side positive (detached) |
+| `grounding_valid_samples_qry` | Số sample hợp lệ (qry) |
+| `grounding_valid_samples_pos` | Số sample hợp lệ (pos) |
+
+---
+
+## 5. Ràng buộc gradient & DDP
 
 | Thành phần | Teacher gradient | Student gradient |
 |------------|------------------|------------------|
 | Contrastive | ✗ | ✓ (pooled rep) |
 | CKA | ✗ (detach) | ✓ (global embed) |
 | SEKD spectral Teacher | ✗ (detach $E_T$, $Q_T$, $\lambda_T$, $k_g$) | ✓ (QR path) |
+| Grounding $C_{\mathrm{aligned}}$ teacher | ✗ (detach $C^T$ và output aligned) | ✓ (qua $C^S \to C_{\mathrm{aligned}}^S$) |
+| $A_v$, $A_t$ (geometry) | ✗ (constant) | ✗ |
 | kNN indices, nullity, eigengap | ✗ (no_grad) | ✗ |
 
 **DDP:** Sample invalid được zero-out; aggregation dùng `sum(loss) / valid_samples` để tránh deadlock khi số graph khác nhau giữa rank.
@@ -429,7 +557,7 @@ Nguồn: [`src/arguments.py`](../src/arguments.py), [`scripts/cls/train_SEGD_fas
 | Arg | CLI | Default (script) | Ý nghĩa |
 |-----|-----|------------------|---------|
 | `kd_loss_type` | `--kd_loss_type` | `segd_loss` | Chọn criterion |
-| `kd_weight` | `--kd_weight` | `0.05` | Scale `segd_loss` và `cka_loss` |
+| `kd_weight` | `--kd_weight` | `0.05` | Scale `segd_loss`, `cka_loss`, `grounding_loss` |
 
 ### Contrastive (model-level)
 
@@ -460,6 +588,9 @@ Nguồn: [`src/arguments.py`](../src/arguments.py), [`scripts/cls/train_SEGD_fas
 | `sekd_eig_eps` | `--sekd_eig_eps` | `1e-6` | Ngưỡng null eigenvalue |
 | `sekd_align_grid_h` | `--sekd_align_grid_h` | `10` | $H_0$ lưới vision chung |
 | `sekd_align_grid_w` | `--sekd_align_grid_w` | `10` | $W_0$ lưới vision chung |
+| `w_loss_grounding` | `--w_loss_grounding` | `0.5` | Trọng số Semantic Grounding |
+| `sekd_grounding_temp` | `--sekd_grounding_temp` | `0.1` | $\tau_{\mathrm{ground}}$ |
+| `sekd_grounding_bidirectional` | `--sekd_grounding_bidirectional` | `True` | KL hai chiều v↔t |
 | `teacher_patch_size` | `--teacher_patch_size` | `28` | Suy ra grid vision teacher |
 | `student_patch_size` | `--student_patch_size` | `64` | Suy ra grid vision student |
 
@@ -475,6 +606,7 @@ Nguồn: [`src/arguments.py`](../src/arguments.py), [`scripts/cls/train_SEGD_fas
 | `contrastive_loss` | $\mathcal{L}_{\mathrm{contrastive}}$ |
 | `cka_loss` | $\mathcal{L}_{\mathrm{CKA}}$ |
 | `segd_loss` | $\mathcal{L}_{\mathrm{SEKD}}$ |
+| `grounding_loss` | $\mathcal{L}_{\mathrm{ground}}$ |
 
 ### Metrics theo dõi
 
@@ -482,12 +614,19 @@ Nguồn: [`src/arguments.py`](../src/arguments.py), [`scripts/cls/train_SEGD_fas
 |-----|---------|
 | `segd_loss_qry` | SEKD side query (detached) |
 | `segd_loss_pos` | SEKD side positive (detached) |
+| `grounding_loss_qry` | Grounding side query (detached) |
+| `grounding_loss_pos` | Grounding side positive (detached) |
 | `batch_vision_nodes_qry` | Tổng vision tokens student (qry) |
 | `batch_text_nodes_qry` | Tổng text tokens student (qry) |
 | `batch_vision_nodes_pos` | Tổng vision tokens student (pos) |
 | `batch_text_nodes_pos` | Tổng text tokens student (pos) |
 | `sekd_valid_graphs_qry` | Số graph hợp lệ (qry) trong batch |
 | `sekd_valid_graphs_pos` | Số graph hợp lệ (pos) trong batch |
+| `grounding_valid_samples_qry` | Sample grounding hợp lệ (qry) |
+| `grounding_valid_samples_pos` | Sample grounding hợp lệ (pos) |
+| `sekd_mean_k_g` | Trung bình $k_g$ eigenvectors / batch (cả qry+pos) |
+| `sekd_mean_k_g_qry` | Trung bình $k_g$ (qry) |
+| `sekd_mean_k_g_pos` | Trung bình $k_g$ (pos) |
 
 Định nghĩa log keys: `KD_LOSS_METRIC_KEYS["segd_loss"]` trong [`main.py`](../main.py).
 
@@ -495,12 +634,13 @@ Nguồn: [`src/arguments.py`](../src/arguments.py), [`scripts/cls/train_SEGD_fas
 
 ## Ví dụ hệ số thực tế (script mặc định)
 
-Với `KD_WEIGHT=0.05`, `W_LOSS_CKA=1.0`:
+Với `KD_WEIGHT=0.05`, `W_LOSS_CKA=1.0`, `W_LOSS_GROUNDING=0.5`:
 
 ```
 loss = contrastive
      + 0.05 * segd_loss
      + 0.05 * 1.0 * cka_loss
+     + 0.05 * 0.5 * grounding_loss
 ```
 
 ---
@@ -509,7 +649,7 @@ loss = contrastive
 
 | File | Nội dung |
 |------|----------|
-| `src/criterions/segd_loss.py` | `SEGDLoss`, SEKD helpers, `CKALoss`, `pool_global_embedding` |
+| `src/criterions/segd_loss.py` | `SEGDLoss`, SEKD helpers, `align_bipartite_affinity_for_grounding`, `semantic_grounding_kl_loss`, `CKALoss` |
 | `src/criterions/sgd_loss.py` | Text offset helpers (reuse, không dùng cluster/pre-align) |
 | `src/model/model.py` | `encode_input`, `_pooling` (contrastive) |
 | `src/arguments.py` | CLI hyperparameters |
@@ -528,4 +668,5 @@ loss = contrastive
 | Batch-level Grassman spectral | ✓ | ✗ |
 | DBSCAN / pre-align hidden | ✓ | ✗ |
 | SEKD per-sample post-spectral | ✗ | ✓ |
+| Semantic Grounding (aligned $C_{\mathrm{aligned}}$ KL) | ✗ | ✓ |
 | CKA batch-level | ✗ (đã xóa) | ✓ (có `--cka_pooling`) |

@@ -5,9 +5,12 @@ Loss composition:
   total = contrastive_loss
         + kd_weight * segd_loss
         + kd_weight * w_loss_cka * cka_loss
+        + kd_weight * w_loss_grounding * grounding_loss
 
 SEKD runs per-sample (query / positive independently). Graphs are built on
 native tokens; modality-aware alignment is applied only after eigendecomposition.
+Semantic Grounding Distillation reuses bipartite vision–text cosine matrices
+c_ij from the G_vt pipeline (before Laplacian) for direct KL alignment.
 CKA uses batch-level linear CKA on global embeddings from the last hidden layer,
 with pooling controlled by ``--cka_pooling`` (``mean`` or ``last``/``eos``).
 Teacher spectral tensors are always detached — gradients flow only through the
@@ -335,6 +338,111 @@ def build_knn_self_tuning_adjacency(
     return W.to(dtype=dtype)
 
 
+def bipartite_relu_cosine_matrix(h_v: torch.Tensor, h_t: torch.Tensor) -> torch.Tensor:
+    """
+    Vision–text affinity matrix C with L2-normalized rows:
+      C_ij = max(0, h_i^v · h_j^t)
+
+    Returns:
+        Tensor of shape [n_v, n_t].
+    """
+    if h_v.size(0) == 0 or h_t.size(0) == 0:
+        return h_v.new_zeros(h_v.size(0), h_t.size(0))
+    return (h_v.float() @ h_t.float().t()).clamp_min(0.0)
+
+
+def build_bipartite_adjacency_from_cosine(c: torch.Tensor) -> torch.Tensor:
+    """Symmetric bipartite adjacency W = [[0, C], [C^T, 0]] from precomputed C."""
+    n_v, n_t = c.shape
+    device, dtype = c.device, c.dtype
+    n = n_v + n_t
+    w = torch.zeros(n, n, device=device, dtype=torch.float32)
+    c32 = c.float()
+    w[:n_v, n_v:] = c32
+    w[n_v:, :n_v] = c32.t()
+    return w.to(dtype=dtype)
+
+
+def align_bipartite_affinity_for_grounding(
+    c: torch.Tensor,
+    a_v: torch.Tensor,
+    a_t: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    """
+    Project raw vision–text affinity into a shared grid × shared-word space.
+
+    Teacher and student have different native token counts (patch size / tokenizer),
+    so KL on raw ``C [N_v, N_t]`` is semantically invalid. Reuse the same alignment
+    operators as post-spectral SEKD (bilinear vision grid + word–token overlap):
+
+        C_aligned = A_v @ C @ A_t^T   -> [H0*W0, M]
+
+    Args:
+        c: [N_v, N_t] ReLU cosine affinity (teacher or student).
+        a_v: [H0*W0, N_v] vision resampling operator (per-model geometry).
+        a_t: [M, N_t] text overlap operator on shared-word rows (per-model).
+
+    Returns:
+        Aligned matrix or None when shapes are incompatible.
+    """
+    if c.numel() == 0 or a_v is None or a_t is None:
+        return None
+    n_v, n_t = c.shape
+    if a_v.size(1) != n_v or a_t.size(1) != n_t:
+        return None
+    if a_v.size(0) == 0 or a_t.size(0) == 0:
+        return None
+    return a_v.float() @ c.float() @ a_t.t().float()
+
+
+def semantic_grounding_kl_loss(
+    c_teacher: torch.Tensor,
+    c_student: torch.Tensor,
+    temperature: float,
+    bidirectional: bool = True,
+) -> torch.Tensor:
+    """
+    Semantic Grounding Distillation via KL(p_teacher || p_student).
+
+    Expects **aligned** affinity matrices ``C_aligned`` of shape ``[H0*W0, M]``
+    (common vision grid × shared words), produced by
+    ``align_bipartite_affinity_for_grounding``. Raw native-token ``C`` must not be
+    passed here — teacher/student ``N_v`` / ``N_t`` differ across patch sizes.
+
+    Each vision-grid row defines a distribution over shared words via softmax.
+    Teacher probabilities are detached upstream.
+
+    Args:
+        c_teacher: [H0*W0, M] teacher aligned affinity (detached before call).
+        c_student: [H0*W0, M] student aligned affinity (differentiable).
+        temperature: softmax temperature tau_grounding.
+        bidirectional: if True, also average text→vision KL on C^T.
+    """
+    if c_teacher.shape != c_student.shape:
+        if __debug__:
+            raise ValueError(
+                "Aligned grounding matrices must match: "
+                f"teacher {tuple(c_teacher.shape)} vs student {tuple(c_student.shape)}"
+            )
+        return c_student.new_tensor(0.0)
+
+    tau = max(float(temperature), _EPS)
+    c_t = c_teacher.detach().float()
+    c_s = c_student.float()
+
+    p_teacher = F.softmax(c_t / tau, dim=-1)
+    log_p_student = F.log_softmax(c_s / tau, dim=-1)
+    loss_v2t = F.kl_div(log_p_student, p_teacher, reduction="batchmean")
+
+    if bidirectional:
+        p_teacher_tw = F.softmax(c_t.t() / tau, dim=-1)
+        log_p_student_tw = F.log_softmax(c_s.t() / tau, dim=-1)
+        loss_t2v = F.kl_div(log_p_student_tw, p_teacher_tw, reduction="batchmean")
+        loss_v2t = 0.5 * (loss_v2t + loss_t2v)
+
+    return loss_v2t.to(c_student.dtype)
+
+
 def build_bipartite_relu_cosine_adjacency(
     h_v: torch.Tensor,
     h_t: torch.Tensor,
@@ -344,17 +452,8 @@ def build_bipartite_relu_cosine_adjacency(
       C_ij = max(0, h_i^v · h_j^t)
       W = [[0, C], [C^T, 0]]
     """
-    n_v, n_t = h_v.size(0), h_t.size(0)
-    device, dtype = h_v.device, h_v.dtype
-    n = n_v + n_t
-    if n_v == 0 or n_t == 0:
-        return torch.zeros(n, n, device=device, dtype=dtype)
-
-    c = (h_v.float() @ h_t.float().t()).clamp_min(0.0)
-    W = torch.zeros(n, n, device=device, dtype=torch.float32)
-    W[:n_v, n_v:] = c
-    W[n_v:, :n_v] = c.t()
-    return W.to(dtype=dtype)
+    c = bipartite_relu_cosine_matrix(h_v, h_t)
+    return build_bipartite_adjacency_from_cosine(c)
 
 
 def unnormalized_laplacian(W: torch.Tensor) -> torch.Tensor:
@@ -553,15 +652,18 @@ def _spectral_pair_loss(
     k_min: int,
     k_max: int,
     eig_eps: float,
-) -> Optional[torch.Tensor]:
+) -> Tuple[Optional[torch.Tensor], int]:
     """
     Shared path for one graph type:
       normalize → W → L → eigh → adaptive k (teacher) → eigenmaps → align → QR loss.
+
+    Returns:
+        (subspace_loss, k_g used) or (None, 0) when invalid.
     """
     if h_t is None or h_s is None:
-        return None
+        return None, 0
     if h_t.size(0) < 2 or h_s.size(0) < 2:
-        return None
+        return None, 0
 
     h_t_n = l2_normalize_tokens(h_t.float())
     h_s_n = l2_normalize_tokens(h_s.float())
@@ -574,10 +676,10 @@ def _spectral_pair_loss(
         c_t = _count_nullity(eval_t, eig_eps)
         k_g = select_adaptive_kg(eval_t, c_t, k_min=k_min, k_max=k_max)
         if k_g <= 0:
-            return None
+            return None, 0
         e_t = extract_eigenmap(evec_t, c_t, k_g)
         if e_t is None:
-            return None
+            return None, 0
         e_t = e_t.detach()
 
     # Student spectral (grad through W / L / eigh / eigenmap).
@@ -590,22 +692,22 @@ def _spectral_pair_loss(
         max_ks = max(0, evec_s.size(0) - c_s - 0)
         k_g_s = min(k_g, max_ks)
     if k_g_s <= 0:
-        return None
+        return None, 0
     # Re-extract teacher with possibly reduced k for QR compatibility.
     k_use = min(k_g, k_g_s)
     e_t = e_t[:, :k_use]
     e_s = extract_eigenmap(evec_s, c_s, k_use)
     if e_s is None:
-        return None
+        return None, 0
 
     z_t = align_fn_t(e_t)
     z_s = align_fn_s(e_s)
     if z_t is None or z_s is None:
-        return None
+        return None, 0
     if z_t.size(0) != z_s.size(0) or z_t.size(0) < 1:
-        return None
+        return None, 0
 
-    return subspace_loss_from_qr(z_t, z_s)
+    return subspace_loss_from_qr(z_t, z_s), k_use
 
 
 # ---------------------------------------------------------------------------
@@ -633,6 +735,11 @@ class SEGDLoss(nn.Module):
         self.w_loss_v = float(getattr(args, "w_loss_v", 1.0))
         self.w_loss_t = float(getattr(args, "w_loss_t", 1.0))
         self.w_loss_cross = float(getattr(args, "w_loss_cross", 1.0))
+        self.w_loss_grounding = float(getattr(args, "w_loss_grounding", 0.5))
+        self.sekd_grounding_temp = float(getattr(args, "sekd_grounding_temp", 0.1))
+        self.sekd_grounding_bidirectional = bool(
+            getattr(args, "sekd_grounding_bidirectional", True)
+        )
 
         self.knn_neighbors = int(getattr(args, "knn_neighbors", 10))
         self.k_min = int(getattr(args, "sekd_k_min", 2))
@@ -705,10 +812,10 @@ class SEGDLoss(nn.Module):
         img_w: int,
         img_h: int,
         has_image: bool,
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
         """
-        Compute weighted SEKD loss for one sample across valid graphs.
-        Returns (loss, stats).
+        Compute weighted SEKD + grounding loss for one sample across valid graphs.
+        Returns (sekd_loss, grounding_loss, stats).
         """
         device = (
             s_vision.device if s_vision is not None
@@ -735,10 +842,14 @@ class SEGDLoss(nn.Module):
             "loss_v": zero_f,
             "loss_t": zero_f,
             "loss_cross": zero_f,
+            "grounding_valid": 0.0,
+            "k_g_sum": 0.0,
+            "k_g_count": 0.0,
         }
 
         losses: List[torch.Tensor] = []
         weights: List[float] = []
+        grounding_losses: List[torch.Tensor] = []
 
         # --- Shared text alignment operators (post-spectral) ---
         word_spans = build_word_char_spans(reference_text)
@@ -771,7 +882,7 @@ class SEGDLoss(nn.Module):
             def build_w_v(h_n):
                 return build_knn_self_tuning_adjacency(h_n, self.knn_neighbors)
 
-            loss_v = _spectral_pair_loss(
+            loss_v, k_g_v = _spectral_pair_loss(
                 t_vision, s_vision, build_w_v,
                 align_fn_t=lambda e: align_vision_eigenmap(e, th, tw, tgt_h, tgt_w),
                 align_fn_s=lambda e: align_vision_eigenmap(e, sh, sw, tgt_h, tgt_w),
@@ -784,6 +895,8 @@ class SEGDLoss(nn.Module):
                 weights.append(self.w_loss_v)
                 stats["graph_v"] = 1.0
                 stats["loss_v"] = loss_v.float()
+                stats["k_g_sum"] += float(k_g_v)
+                stats["k_g_count"] += 1.0
 
         # ===== G_t =====
         if (
@@ -795,7 +908,7 @@ class SEGDLoss(nn.Module):
             def build_w_t(h_n):
                 return build_knn_self_tuning_adjacency(h_n, self.knn_neighbors)
 
-            loss_t = _spectral_pair_loss(
+            loss_t, k_g_t = _spectral_pair_loss(
                 t_text, s_text, build_w_t,
                 align_fn_t=lambda e: align_text_eigenmap(e, a_t_teacher),
                 align_fn_s=lambda e: align_text_eigenmap(e, a_t_student),
@@ -808,8 +921,12 @@ class SEGDLoss(nn.Module):
                 weights.append(self.w_loss_t)
                 stats["graph_t"] = 1.0
                 stats["loss_t"] = loss_t.float()
+                stats["k_g_sum"] += float(k_g_t)
+                stats["k_g_count"] += 1.0
 
-        # ===== G_vt =====
+        # ===== G_vt (bipartite) + Semantic Grounding =====
+        c_t_vt: Optional[torch.Tensor] = None
+        c_s_vt: Optional[torch.Tensor] = None
         if (
             has_image
             and t_vision is not None and s_vision is not None
@@ -817,11 +934,18 @@ class SEGDLoss(nn.Module):
             and t_vision.size(0) >= 1 and s_vision.size(0) >= 1
             and t_text.size(0) >= 1 and s_text.size(0) >= 1
             and a_t_teacher is not None and a_t_student is not None
-            and self.w_loss_cross > 0
         ):
+            h_t_v_n = l2_normalize_tokens(t_vision.float())
+            h_t_t_n = l2_normalize_tokens(t_text.float())
+            h_s_v_n = l2_normalize_tokens(s_vision.float())
+            h_s_t_n = l2_normalize_tokens(s_text.float())
+            with torch.no_grad():
+                c_t_vt = bipartite_relu_cosine_matrix(h_t_v_n, h_t_t_n)
+            c_s_vt = bipartite_relu_cosine_matrix(h_s_v_n, h_s_t_n)
+
             th, tw = t_hw
             sh, sw = s_hw
-            # Precompute vision alignment densematrices for block-diag path.
+            # Separate A_v per model — patch grids differ though target is H0×W0.
             a_v_t = build_vision_alignment_operator(
                 t_vision.size(0), th, tw, tgt_h, tgt_w, device, dtype,
             )
@@ -829,12 +953,38 @@ class SEGDLoss(nn.Module):
                 s_vision.size(0), sh, sw, tgt_h, tgt_w, device, dtype,
             )
 
-            if a_v_t is not None and a_v_s is not None:
+            if self.w_loss_grounding > 0 and a_v_t is not None and a_v_s is not None:
+                # A_v / A_t are geometry-only (no grad); gradient flows via C_student only.
+                c_aligned_t = align_bipartite_affinity_for_grounding(
+                    c_t_vt, a_v_t, a_t_teacher,
+                )
+                c_aligned_s = align_bipartite_affinity_for_grounding(
+                    c_s_vt, a_v_s, a_t_student,
+                )
+                if c_aligned_t is not None and c_aligned_s is not None:
+                    if __debug__:
+                        assert c_aligned_t.shape == c_aligned_s.shape, (
+                            f"grounding shape mismatch: teacher {c_aligned_t.shape} "
+                            f"vs student {c_aligned_s.shape}"
+                        )
+                    g_loss = semantic_grounding_kl_loss(
+                        c_aligned_t.detach(),
+                        c_aligned_s,
+                        self.sekd_grounding_temp,
+                        bidirectional=self.sekd_grounding_bidirectional,
+                    )
+                    if torch.isfinite(g_loss):
+                        grounding_losses.append(g_loss)
+                        stats["grounding_valid"] = 1.0
+
+            if self.w_loss_cross > 0 and a_v_t is not None and a_v_s is not None:
                 t_vt = torch.cat([t_vision, t_text], dim=0)
                 s_vt = torch.cat([s_vision, s_text], dim=0)
-                loss_vt = self._bipartite_pair_loss(
+                loss_vt, k_g_vt = self._bipartite_pair_loss(
                     t_vt, s_vt, t_vision.size(0), s_vision.size(0),
                     a_v_t, a_v_s, a_t_teacher, a_t_student,
+                    c_teacher=c_t_vt,
+                    c_student=c_s_vt,
                 )
                 if loss_vt is not None and torch.isfinite(loss_vt):
                     losses.append(loss_vt)
@@ -844,10 +994,21 @@ class SEGDLoss(nn.Module):
 
         if not losses:
             return zero, stats
+                    stats["k_g_sum"] += float(k_g_vt)
+                    stats["k_g_count"] += 1.0
 
-        w_sum = sum(weights)
-        weighted = sum(w * l for w, l in zip(weights, losses)) / max(w_sum, _EPS)
-        return weighted, stats
+        if not losses:
+            segd_loss = self._zero(device, dtype)
+        else:
+            w_sum = sum(weights)
+            segd_loss = sum(w * l for w, l in zip(weights, losses)) / max(w_sum, _EPS)
+
+        if grounding_losses:
+            grounding_loss = sum(grounding_losses) / len(grounding_losses)
+        else:
+            grounding_loss = self._zero(device, dtype)
+
+        return segd_loss, grounding_loss, stats
 
     def _bipartite_pair_loss(
         self,
@@ -859,48 +1020,59 @@ class SEGDLoss(nn.Module):
         a_v_s: torch.Tensor,
         a_t_t: torch.Tensor,
         a_t_s: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
+        c_teacher: Optional[torch.Tensor] = None,
+        c_student: Optional[torch.Tensor] = None,
+    ) -> Tuple[Optional[torch.Tensor], int]:
         if h_t.size(0) < 3 or h_s.size(0) < 3:
-            return None
+            return None, 0
 
         h_t_n = l2_normalize_tokens(h_t.float())
         h_s_n = l2_normalize_tokens(h_s.float())
 
+        if c_teacher is None:
+            with torch.no_grad():
+                c_teacher = bipartite_relu_cosine_matrix(
+                    h_t_n[:n_v_t], h_t_n[n_v_t:],
+                )
+        if c_student is None:
+            c_student = bipartite_relu_cosine_matrix(
+                h_s_n[:n_v_s], h_s_n[n_v_s:],
+            )
+
         with torch.no_grad():
-            w_t = build_bipartite_relu_cosine_adjacency(h_t_n[:n_v_t], h_t_n[n_v_t:])
+            w_t = build_bipartite_adjacency_from_cosine(c_teacher.detach())
             L_t = unnormalized_laplacian(w_t)
             eval_t, evec_t = eigendecompose_laplacian(L_t, eig_eps=self.eig_eps)
             c_t = _count_nullity(eval_t, self.eig_eps)
             k_g = select_adaptive_kg(eval_t, c_t, self.k_min, self.k_max)
             if k_g <= 0:
-                return None
+                return None, 0
             e_t = extract_eigenmap(evec_t, c_t, k_g)
             if e_t is None:
-                return None
+                return None, 0
             e_t = e_t.detach()
 
-        w_s = build_bipartite_relu_cosine_adjacency(h_s_n[:n_v_s], h_s_n[n_v_s:])
+        w_s = build_bipartite_adjacency_from_cosine(c_student)
         L_s = unnormalized_laplacian(w_s)
         eval_s, evec_s = eigendecompose_laplacian(L_s, eig_eps=self.eig_eps)
         with torch.no_grad():
             c_s = _count_nullity(eval_s.detach(), self.eig_eps)
             k_g_s = min(k_g, max(0, evec_s.size(0) - c_s))
         if k_g_s <= 0:
-            return None
+            return None, 0
         k_use = min(k_g, k_g_s)
         e_t = e_t[:, :k_use]
         e_s = extract_eigenmap(evec_s, c_s, k_use)
         if e_s is None:
-            return None
+            return None, 0
 
         z_t = align_bipartite_eigenmap(e_t, n_v_t, a_v_t, a_t_t)
         z_s = align_bipartite_eigenmap(e_s, n_v_s, a_v_s, a_t_s)
         if z_t is None or z_s is None:
-            return None
-        # Aligned dims: vision grid is shared; text words are shared → same row count.
+            return None, 0
         if z_t.size(0) != z_s.size(0):
-            return None
-        return subspace_loss_from_qr(z_t, z_s)
+            return None, 0
+        return subspace_loss_from_qr(z_t, z_s), k_use
 
     def _extract_sample_modalities(
         self,
@@ -997,6 +1169,10 @@ class SEGDLoss(nn.Module):
         sample_loss_v: List[torch.Tensor] = []
         sample_loss_t: List[torch.Tensor] = []
         sample_loss_cross: List[torch.Tensor] = []
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
+        """Average SEKD and grounding over samples on one side (qry or pos)."""
+        sample_losses: List[torch.Tensor] = []
+        grounding_losses: List[torch.Tensor] = []
         agg = {
             "vision_nodes": 0.0,
             "text_nodes": 0.0,
@@ -1004,6 +1180,12 @@ class SEGDLoss(nn.Module):
             "n_loss_v": 0.0,
             "n_loss_t": 0.0,
             "n_loss_cross": 0.0,
+            "graph_v": 0.0,
+            "graph_t": 0.0,
+            "graph_vt": 0.0,
+            "grounding_valid_samples": 0.0,
+            "k_g_sum": 0.0,
+            "k_g_count": 0.0,
         }
 
         for i in range(batch_size):
@@ -1013,8 +1195,7 @@ class SEGDLoss(nn.Module):
                 s_img_feats, t_img_feats, s_hidden, t_hidden, image_sizes, i,
                 teacher_tokenizer, student_tokenizer,
             )
-            loss_i, stats_i = self._sample_sekd_loss(**mods)
-            # DDP-safe: always append a finite contribution (0 if invalid).
+            loss_i, grounding_i, stats_i = self._sample_sekd_loss(**mods)
             if stats_i["graph_v"] + stats_i["graph_t"] + stats_i["graph_vt"] > 0:
                 sample_losses.append(loss_i)
                 agg["valid_samples"] += 1.0
@@ -1033,6 +1214,19 @@ class SEGDLoss(nn.Module):
 
             agg["vision_nodes"] += stats_i["vision_nodes_s"]
             agg["text_nodes"] += stats_i["text_nodes_s"]
+            if stats_i["grounding_valid"] > 0:
+                grounding_losses.append(grounding_i)
+                agg["grounding_valid_samples"] += 1.0
+            else:
+                grounding_losses.append(grounding_i * 0.0)
+
+            agg["vision_nodes"] += stats_i["vision_nodes_s"]
+            agg["text_nodes"] += stats_i["text_nodes_s"]
+            agg["graph_v"] += stats_i["graph_v"]
+            agg["graph_t"] += stats_i["graph_t"]
+            agg["graph_vt"] += stats_i["graph_vt"]
+            agg["k_g_sum"] += stats_i["k_g_sum"]
+            agg["k_g_count"] += stats_i["k_g_count"]
 
         zero = self._zero(device)
         if not sample_losses:
@@ -1067,6 +1261,22 @@ class SEGDLoss(nn.Module):
             "loss_t": _mean_component(sample_loss_t, agg["n_loss_t"]),
             "loss_cross": _mean_component(sample_loss_cross, agg["n_loss_cross"]),
         }
+            zero = self._zero(device)
+            return zero, zero, agg
+
+        stacked = torch.stack(sample_losses)
+        if agg["valid_samples"] > 0:
+            segd_loss = stacked.sum() / max(agg["valid_samples"], 1.0)
+        else:
+            segd_loss = stacked.mean()
+
+        stacked_g = torch.stack(grounding_losses)
+        if agg["grounding_valid_samples"] > 0:
+            grounding_loss = stacked_g.sum() / max(agg["grounding_valid_samples"], 1.0)
+        else:
+            grounding_loss = stacked_g.mean()
+
+        return segd_loss, grounding_loss, agg
 
     def forward(self, distiller, input_data):
         student_model = distiller.student
@@ -1161,14 +1371,14 @@ class SEGDLoss(nn.Module):
         )
 
         # ----- SEKD (per-sample, post-spectral alignment) -----
-        segd_qry, stats_qry = self._side_sekd_loss(
+        segd_qry, grounding_qry, stats_qry = self._side_sekd_loss(
             batch_size,
             teacher_qry_input, student_qry_input, qry_text_strings,
             student_qry_image_features, teacher_qry_image_features,
             student_qry_hidden_states, teacher_qry_hidden_states,
             qry_image_sizes, teacher_tokenizer, student_tokenizer, device,
         )
-        segd_pos, stats_pos = self._side_sekd_loss(
+        segd_pos, grounding_pos, stats_pos = self._side_sekd_loss(
             batch_size,
             teacher_pos_input, student_pos_input, pos_text_strings,
             student_pos_image_features, teacher_pos_image_features,
@@ -1189,12 +1399,18 @@ class SEGDLoss(nn.Module):
         avg_vt_nodes = 0.5 * (
             stats_qry["avg_vt_nodes"] + stats_pos["avg_vt_nodes"]
         )
+        grounding_loss = 0.5 * (grounding_qry + grounding_pos)
 
         total_loss = (
             contrastive_loss
             + self.kd_weight * segd_loss
             + self.kd_weight * self.w_loss_cka * cka_loss
+            + self.kd_weight * self.w_loss_grounding * grounding_loss
         )
+
+        k_g_count = stats_qry["k_g_count"] + stats_pos["k_g_count"]
+        k_g_sum = stats_qry["k_g_sum"] + stats_pos["k_g_sum"]
+        mean_k_g = k_g_sum / max(k_g_count, 1.0)
 
         def _metric(v: float) -> torch.Tensor:
             return torch.tensor(v, device=device, dtype=torch.float32)
@@ -1210,4 +1426,31 @@ class SEGDLoss(nn.Module):
             "avg_vision_nodes": _metric(avg_vision_nodes),
             "avg_text_nodes": _metric(avg_text_nodes),
             "avg_vt_nodes": _metric(avg_vt_nodes),
+            "contrastive_loss": contrastive_loss,
+            "cka_loss": cka_loss,
+            "segd_loss": segd_loss,
+            "segd_loss_qry": segd_qry.detach(),
+            "segd_loss_pos": segd_pos.detach(),
+            "grounding_loss": grounding_loss,
+            "grounding_loss_qry": grounding_qry.detach(),
+            "grounding_loss_pos": grounding_pos.detach(),
+            "batch_vision_nodes_qry": _metric(stats_qry["vision_nodes"]),
+            "batch_text_nodes_qry": _metric(stats_qry["text_nodes"]),
+            "batch_vision_nodes_pos": _metric(stats_pos["vision_nodes"]),
+            "batch_text_nodes_pos": _metric(stats_pos["text_nodes"]),
+            "sekd_valid_graphs_qry": _metric(
+                stats_qry["graph_v"] + stats_qry["graph_t"] + stats_qry["graph_vt"]
+            ),
+            "sekd_valid_graphs_pos": _metric(
+                stats_pos["graph_v"] + stats_pos["graph_t"] + stats_pos["graph_vt"]
+            ),
+            "grounding_valid_samples_qry": _metric(stats_qry["grounding_valid_samples"]),
+            "grounding_valid_samples_pos": _metric(stats_pos["grounding_valid_samples"]),
+            "sekd_mean_k_g": _metric(mean_k_g),
+            "sekd_mean_k_g_qry": _metric(
+                stats_qry["k_g_sum"] / max(stats_qry["k_g_count"], 1.0)
+            ),
+            "sekd_mean_k_g_pos": _metric(
+                stats_pos["k_g_sum"] / max(stats_pos["k_g_count"], 1.0)
+            ),
         }
