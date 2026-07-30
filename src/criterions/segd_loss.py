@@ -991,9 +991,6 @@ class SEGDLoss(nn.Module):
                     weights.append(self.w_loss_cross)
                     stats["graph_vt"] = 1.0
                     stats["loss_cross"] = loss_vt.float()
-
-        if not losses:
-            return zero, stats
                     stats["k_g_sum"] += float(k_g_vt)
                     stats["k_g_count"] += 1.0
 
@@ -1163,16 +1160,13 @@ class SEGDLoss(nn.Module):
         teacher_tokenizer,
         student_tokenizer,
         device: torch.device,
-    ) -> Tuple[torch.Tensor, Dict[str, object]]:
-        """Average SEKD over samples on one side (qry or pos). Always returns a tensor."""
-        sample_losses: List[torch.Tensor] = []
-        sample_loss_v: List[torch.Tensor] = []
-        sample_loss_t: List[torch.Tensor] = []
-        sample_loss_cross: List[torch.Tensor] = []
-    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, object]]:
         """Average SEKD and grounding over samples on one side (qry or pos)."""
         sample_losses: List[torch.Tensor] = []
         grounding_losses: List[torch.Tensor] = []
+        sample_loss_v: List[torch.Tensor] = []
+        sample_loss_t: List[torch.Tensor] = []
+        sample_loss_cross: List[torch.Tensor] = []
         agg = {
             "vision_nodes": 0.0,
             "text_nodes": 0.0,
@@ -1214,23 +1208,21 @@ class SEGDLoss(nn.Module):
 
             agg["vision_nodes"] += stats_i["vision_nodes_s"]
             agg["text_nodes"] += stats_i["text_nodes_s"]
+            agg["graph_v"] += stats_i["graph_v"]
+            agg["graph_t"] += stats_i["graph_t"]
+            agg["graph_vt"] += stats_i["graph_vt"]
+            agg["k_g_sum"] += stats_i["k_g_sum"]
+            agg["k_g_count"] += stats_i["k_g_count"]
             if stats_i["grounding_valid"] > 0:
                 grounding_losses.append(grounding_i)
                 agg["grounding_valid_samples"] += 1.0
             else:
                 grounding_losses.append(grounding_i * 0.0)
 
-            agg["vision_nodes"] += stats_i["vision_nodes_s"]
-            agg["text_nodes"] += stats_i["text_nodes_s"]
-            agg["graph_v"] += stats_i["graph_v"]
-            agg["graph_t"] += stats_i["graph_t"]
-            agg["graph_vt"] += stats_i["graph_vt"]
-            agg["k_g_sum"] += stats_i["k_g_sum"]
-            agg["k_g_count"] += stats_i["k_g_count"]
-
         zero = self._zero(device)
         if not sample_losses:
-            return zero, {
+            return zero, zero, {
+                **agg,
                 "avg_vision_nodes": 0.0,
                 "avg_text_nodes": 0.0,
                 "avg_vt_nodes": 0.0,
@@ -1238,31 +1230,6 @@ class SEGDLoss(nn.Module):
                 "loss_t": zero,
                 "loss_cross": zero,
             }
-
-        if agg["valid_samples"] > 0:
-            stacked = torch.stack(sample_losses)
-            loss = stacked.sum() / max(agg["valid_samples"], 1.0)
-        else:
-            loss = torch.stack(sample_losses).mean()
-
-        def _mean_component(vals: List[torch.Tensor], n_valid: float) -> torch.Tensor:
-            stacked = torch.stack(vals)
-            if n_valid > 0:
-                return stacked.sum() / n_valid
-            return stacked.mean() * 0.0
-
-        avg_vision = agg["vision_nodes"] / max(batch_size, 1)
-        avg_text = agg["text_nodes"] / max(batch_size, 1)
-        return loss, {
-            "avg_vision_nodes": avg_vision,
-            "avg_text_nodes": avg_text,
-            "avg_vt_nodes": avg_vision + avg_text,
-            "loss_v": _mean_component(sample_loss_v, agg["n_loss_v"]),
-            "loss_t": _mean_component(sample_loss_t, agg["n_loss_t"]),
-            "loss_cross": _mean_component(sample_loss_cross, agg["n_loss_cross"]),
-        }
-            zero = self._zero(device)
-            return zero, zero, agg
 
         stacked = torch.stack(sample_losses)
         if agg["valid_samples"] > 0:
@@ -1275,6 +1242,21 @@ class SEGDLoss(nn.Module):
             grounding_loss = stacked_g.sum() / max(agg["grounding_valid_samples"], 1.0)
         else:
             grounding_loss = stacked_g.mean()
+
+        def _mean_component(vals: List[torch.Tensor], n_valid: float) -> torch.Tensor:
+            stacked_vals = torch.stack(vals)
+            if n_valid > 0:
+                return stacked_vals.sum() / n_valid
+            return stacked_vals.mean() * 0.0
+
+        avg_vision = agg["vision_nodes"] / max(batch_size, 1)
+        avg_text = agg["text_nodes"] / max(batch_size, 1)
+        agg["avg_vision_nodes"] = avg_vision
+        agg["avg_text_nodes"] = avg_text
+        agg["avg_vt_nodes"] = avg_vision + avg_text
+        agg["loss_v"] = _mean_component(sample_loss_v, agg["n_loss_v"])
+        agg["loss_t"] = _mean_component(sample_loss_t, agg["n_loss_t"])
+        agg["loss_cross"] = _mean_component(sample_loss_cross, agg["n_loss_cross"])
 
         return segd_loss, grounding_loss, agg
 
@@ -1426,12 +1408,9 @@ class SEGDLoss(nn.Module):
             "avg_vision_nodes": _metric(avg_vision_nodes),
             "avg_text_nodes": _metric(avg_text_nodes),
             "avg_vt_nodes": _metric(avg_vt_nodes),
-            "contrastive_loss": contrastive_loss,
-            "cka_loss": cka_loss,
-            "segd_loss": segd_loss,
             "segd_loss_qry": segd_qry.detach(),
             "segd_loss_pos": segd_pos.detach(),
-            "grounding_loss": grounding_loss,
+            "grounding_loss": grounding_loss.detach(),
             "grounding_loss_qry": grounding_qry.detach(),
             "grounding_loss_pos": grounding_pos.detach(),
             "batch_vision_nodes_qry": _metric(stats_qry["vision_nodes"]),
