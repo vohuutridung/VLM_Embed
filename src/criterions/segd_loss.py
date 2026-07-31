@@ -5,7 +5,7 @@ Loss composition:
   total = contrastive_loss
         + kd_weight * segd_loss
         + kd_weight * w_loss_cka * cka_loss
-        + kd_weight * w_loss_grounding * grounding_loss
+        + kd_weight * w_loss_grounding * grounding_loss  (effective weight after warmup)
 
 SEKD runs per-sample (query / positive independently). Graphs are built on
 native tokens; modality-aware alignment is applied only after eigendecomposition.
@@ -477,32 +477,40 @@ def select_adaptive_kg(
     k_max: int,
 ) -> int:
     """
-    k_g = argmax_r Δ_r where Δ_r = λ_{c+r+1} - λ_{c+r}, r ∈ [k_min, k_max_eff].
-    Discrete — no gradient.
+    Adaptive eigenmap dimension via eigengap on Teacher spectrum (no gradient).
+
+    Loop variable ``m`` is the number of eigenvectors to select: the set
+    ``[u_{nullity}, ..., u_{nullity + m - 1}]``. For each candidate ``m``,
+    the eigengap is measured immediately after the ``m``-th selected vector,
+    between ``u_{nullity + m - 1}`` and ``u_{nullity + m}``:
+
+        Δ_m = λ_{c + m} - λ_{c + m - 1}
+
+    Returns ``k_g = argmax_m Δ_m`` for ``m ∈ [k_min, k_max_eff]``, so the
+    chosen set stops right before the largest gap in that range.
     """
     n = teacher_eigenvalues.numel()
-    # Need indices c+r and c+r+1 ⇒ r_max ≤ n - c - 2? Actually r can go up to
-    # n - c - 1 eigenvectors available; eigengap at r needs λ_{c+r+1} so r ≤ n-c-2.
-    max_r_by_spectrum = n - teacher_nullity - 2
-    if max_r_by_spectrum < k_min:
-        # Fall back to whatever non-null dims remain (at least 1 if possible).
-        avail = max(0, n - teacher_nullity - 1)
+    c = teacher_nullity
+    # Gap at m uses ev[c + m]; requires c + m <= n - 1 ⇒ m <= n - c - 1.
+    max_m_by_spectrum = n - c - 1
+    if max_m_by_spectrum < k_min:
+        avail = max(0, n - c)
         return max(1, min(avail, k_max)) if avail > 0 else 0
 
-    k_max_eff = min(k_max, max_r_by_spectrum)
+    k_max_eff = min(k_max, max_m_by_spectrum)
     if k_max_eff < k_min:
         return max(1, k_max_eff)
 
     with torch.no_grad():
         ev = teacher_eigenvalues.detach()
-        best_r = k_min
+        best_m = k_min
         best_gap = -1.0
-        for r in range(k_min, k_max_eff + 1):
-            gap = float(ev[teacher_nullity + r + 1] - ev[teacher_nullity + r])
+        for m in range(k_min, k_max_eff + 1):
+            gap = float(ev[c + m] - ev[c + m - 1])
             if gap > best_gap:
                 best_gap = gap
-                best_r = r
-    return int(best_r)
+                best_m = m
+    return int(best_m)
 
 
 def eigendecompose_laplacian(
@@ -524,7 +532,7 @@ def extract_eigenmap(
     nullity: int,
     k_g: int,
 ) -> Optional[torch.Tensor]:
-    """E = [u_{c+1}, ..., u_{c+k_g}] with shape [N, k_g]."""
+    """E = [u_{c}, ..., u_{c+k_g-1}] with shape [N, k_g]."""
     n = eigenvectors.size(0)
     if k_g <= 0:
         return None
@@ -736,6 +744,12 @@ class SEGDLoss(nn.Module):
         self.w_loss_t = float(getattr(args, "w_loss_t", 1.0))
         self.w_loss_cross = float(getattr(args, "w_loss_cross", 1.0))
         self.w_loss_grounding = float(getattr(args, "w_loss_grounding", 0.5))
+        self.w_loss_grounding_warmup_steps = int(
+            getattr(args, "w_loss_grounding_warmup_steps", 0)
+        )
+        # Low temperature (default 0.1) sharpens softmax; KL is sensitive to small
+        # errors early in training. If grounding_loss spikes vs segd_loss in the first
+        # few hundred steps, try a higher value via CLI (e.g. 0.2–0.3) without code changes.
         self.sekd_grounding_temp = float(getattr(args, "sekd_grounding_temp", 0.1))
         self.sekd_grounding_bidirectional = bool(
             getattr(args, "sekd_grounding_bidirectional", True)
@@ -753,6 +767,21 @@ class SEGDLoss(nn.Module):
 
         self.cka = CKALoss(eps=1e-8)
         self._student_tokenizer = None
+        self._training_step = 0
+
+    def set_training_step(self, current_step: int) -> None:
+        """Sync global optimizer step for grounding weight warmup (DDP-safe)."""
+        self._training_step = int(current_step)
+
+    def configure_grounding_warmup(self, warmup_steps: int) -> None:
+        """Set resolved warmup steps (e.g. from ratio × max_train_steps in main)."""
+        self.w_loss_grounding_warmup_steps = int(warmup_steps)
+
+    def _get_grounding_weight(self, current_step: int) -> float:
+        if self.w_loss_grounding_warmup_steps <= 0:
+            return self.w_loss_grounding
+        ratio = min(1.0, current_step / self.w_loss_grounding_warmup_steps)
+        return self.w_loss_grounding * ratio
 
     def _get_student_tokenizer(self, distiller):
         if self._student_tokenizer is None:
@@ -1383,11 +1412,17 @@ class SEGDLoss(nn.Module):
         )
         grounding_loss = 0.5 * (grounding_qry + grounding_pos)
 
+        effective_w_grounding = self._get_grounding_weight(self._training_step)
+        segd_detached = segd_loss.detach()
+        grounding_detached = grounding_loss.detach()
+        grounding_weighted = grounding_detached * effective_w_grounding
+        grounding_to_segd_ratio = grounding_weighted / (segd_detached + _EPS)
+
         total_loss = (
             contrastive_loss
             + self.kd_weight * segd_loss
             + self.kd_weight * self.w_loss_cka * cka_loss
-            + self.kd_weight * self.w_loss_grounding * grounding_loss
+            + self.kd_weight * effective_w_grounding * grounding_loss
         )
 
         k_g_count = stats_qry["k_g_count"] + stats_pos["k_g_count"]
@@ -1413,6 +1448,8 @@ class SEGDLoss(nn.Module):
             "grounding_loss": grounding_loss.detach(),
             "grounding_loss_qry": grounding_qry.detach(),
             "grounding_loss_pos": grounding_pos.detach(),
+            "grounding_weight_effective": _metric(effective_w_grounding),
+            "grounding_to_segd_ratio": grounding_to_segd_ratio,
             "batch_vision_nodes_qry": _metric(stats_qry["vision_nodes"]),
             "batch_text_nodes_qry": _metric(stats_qry["text_nodes"]),
             "batch_vision_nodes_pos": _metric(stats_pos["vision_nodes"]),

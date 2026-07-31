@@ -183,6 +183,21 @@ class TrainingArguments(TrainingArguments):
         default=0.5,
         metadata={"help": "weight for Semantic Grounding Distillation (KL on G_vt c_ij) in SEGDLoss"},
     )
+    w_loss_grounding_warmup_steps: int = field(
+        default=0,
+        metadata={
+            "help": "Linear warmup steps for w_loss_grounding (0→target). "
+            "If > 0, overrides w_loss_grounding_warmup_ratio. "
+            "0 with ratio=0 disables warmup (constant weight from step 0)."
+        },
+    )
+    w_loss_grounding_warmup_ratio: float = field(
+        default=0.0,
+        metadata={
+            "help": "Fraction of total optimizer steps for grounding weight warmup "
+            "(e.g. 0.15 = 15%%). Used only when w_loss_grounding_warmup_steps is 0."
+        },
+    )
     sekd_grounding_temp: float = field(
         default=0.1,
         metadata={"help": "softmax temperature tau_grounding for Semantic Grounding Distillation"},

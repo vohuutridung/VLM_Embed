@@ -14,15 +14,17 @@ Script train mẫu: [`scripts/cls/train_SEGD_fastvlm.sh`](../scripts/cls/train_S
 loss = contrastive_loss
      + kd_weight * segd_loss
      + kd_weight * w_loss_cka * cka_loss
-     + kd_weight * w_loss_grounding * grounding_loss
+     + kd_weight * w_loss_grounding_effective * grounding_loss
 ```
+
+`w_loss_grounding_effective` = `w_loss_grounding` sau linear warmup (§4, `--w_loss_grounding_warmup_steps`). Khi warmup = 0, bằng `w_loss_grounding` cố định.
 
 | Thành phần | Trọng số mặc định | Mô tả ngắn |
 |------------|-------------------|------------|
 | `contrastive_loss` | 1.0 (implicit) | InfoNCE trên pooled embedding student (query ↔ positive) |
 | `segd_loss` | `kd_weight` | SEKD: distillation phổ Laplacian per-sample (qry + pos) |
 | `cka_loss` | `kd_weight * w_loss_cka` | Linear CKA batch-level trên global embedding student ↔ teacher |
-| `grounding_loss` | `kd_weight * w_loss_grounding` | KL trên $C_{\mathrm{aligned}}$ (affinity $\mathcal{G}_{vt}$ sau align $A_v C A_t^{\top}$) |
+| `grounding_loss` | `kd_weight * w_loss_grounding_effective` | KL trên $C_{\mathrm{aligned}}$ (affinity $\mathcal{G}_{vt}$ sau align $A_v C A_t^{\top}$) |
 
 **Không có:** RKD, local cross-modal affinity, DBSCAN vision cluster, pre-alignment hidden states teacher→student.
 
@@ -352,17 +354,19 @@ $$
 - **Adaptive dimension** (chỉ trên **Teacher**, detach):
 
 $$
-\Delta_r = \lambda_{T,\, c+r+1} - \lambda_{T,\, c+r}
+\Delta_m = \lambda_{T,\, c+m} - \lambda_{T,\, c+m-1}
 $$
 
 $$
-k_g = \arg\max_{r \in [k_{\min},\, k_{\max}^{\mathrm{eff}}]} \Delta_r
+k_g = \arg\max_{m \in [k_{\min},\, k_{\max}^{\mathrm{eff}}]} \Delta_m
 $$
+
+Ở đây $m$ là **số lượng** eigenvector được chọn (không phải index). Gap $\Delta_m$ được đo ngay sau vector thứ $m$ trong tập bắt đầu từ $u_c$: giữa $u_{c+m-1}$ và $u_{c+m}$. $k_g = m$ tối ưu sao cho tập $[u_c, \ldots, u_{c+k_g-1}]$ dừng ngay trước vách gap lớn nhất trong phạm vi.
 
 - Eigenmap:
 
 $$
-E = \left[ u_{c+1},\; u_{c+2},\; \ldots,\; u_{c+k_g} \right]
+E = \left[ u_{c},\; u_{c+1},\; \ldots,\; u_{c+k_g-1} \right]
 \in \mathbb{R}^{N \times k_g}
 $$
 
@@ -517,9 +521,13 @@ $$
 
 | Arg | CLI | Default | Ý nghĩa |
 |-----|-----|---------|---------|
-| `w_loss_grounding` | `--w_loss_grounding` | `0.5` | Trọng số sau `kd_weight` |
-| `sekd_grounding_temp` | `--sekd_grounding_temp` | `0.1` | $\tau_{\mathrm{ground}}$ |
+| `w_loss_grounding` | `--w_loss_grounding` | `0.5` | Trọng số target sau `kd_weight` |
+| `w_loss_grounding_warmup_steps` | `--w_loss_grounding_warmup_steps` | `0` | Warmup steps cố định (override ratio) |
+| `w_loss_grounding_warmup_ratio` | `--w_loss_grounding_warmup_ratio` | `0` | `0.15` = warmup 15% total steps (khi steps = 0) |
+| `sekd_grounding_temp` | `--sekd_grounding_temp` | `0.1` | $\tau_{\mathrm{ground}}$ (temperature thấp → softmax nhọn; spike sớm có thể thử `0.2`–`0.3` qua CLI) |
 | `sekd_grounding_bidirectional` | `--sekd_grounding_bidirectional` | `True` | KL hai chiều v↔t |
+
+**Warmup (runtime):** Nếu `w_loss_grounding_warmup_steps > 0`, dùng trực tiếp. Nếu không, `warmup_steps = max(1, floor(ratio × max_train_steps))` với `w_loss_grounding_warmup_ratio` (vd. `0.15`). `w_loss_grounding_effective(step) = w_loss_grounding × min(1, step / warmup_steps)`.
 
 ### Metric log keys
 
@@ -588,7 +596,9 @@ Nguồn: [`src/arguments.py`](../src/arguments.py), [`scripts/cls/train_SEGD_fas
 | `sekd_eig_eps` | `--sekd_eig_eps` | `1e-6` | Ngưỡng null eigenvalue |
 | `sekd_align_grid_h` | `--sekd_align_grid_h` | `10` | $H_0$ lưới vision chung |
 | `sekd_align_grid_w` | `--sekd_align_grid_w` | `10` | $W_0$ lưới vision chung |
-| `w_loss_grounding` | `--w_loss_grounding` | `0.5` | Trọng số Semantic Grounding |
+| `w_loss_grounding` | `--w_loss_grounding` | `0.5` | Trọng số Semantic Grounding (target) |
+| `w_loss_grounding_warmup_steps` | `--w_loss_grounding_warmup_steps` | `0` | Warmup steps cố định; nếu `> 0` thì bỏ qua ratio |
+| `w_loss_grounding_warmup_ratio` | `--w_loss_grounding_warmup_ratio` | `0` | Warmup = ratio × total optimizer steps (vd. `0.15` = 15%) khi steps = 0 |
 | `sekd_grounding_temp` | `--sekd_grounding_temp` | `0.1` | $\tau_{\mathrm{ground}}$ |
 | `sekd_grounding_bidirectional` | `--sekd_grounding_bidirectional` | `True` | KL hai chiều v↔t |
 | `teacher_patch_size` | `--teacher_patch_size` | `28` | Suy ra grid vision teacher |
@@ -616,6 +626,8 @@ Nguồn: [`src/arguments.py`](../src/arguments.py), [`scripts/cls/train_SEGD_fas
 | `segd_loss_pos` | SEKD side positive (detached) |
 | `grounding_loss_qry` | Grounding side query (detached) |
 | `grounding_loss_pos` | Grounding side positive (detached) |
+| `grounding_weight_effective` | `w_loss_grounding` sau warmup tại step hiện tại |
+| `grounding_to_segd_ratio` | `(grounding_loss × effective_w) / segd_loss` (giám sát cân bằng) |
 | `batch_vision_nodes_qry` | Tổng vision tokens student (qry) |
 | `batch_text_nodes_qry` | Tổng text tokens student (qry) |
 | `batch_vision_nodes_pos` | Tổng vision tokens student (pos) |

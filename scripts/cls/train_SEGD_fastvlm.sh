@@ -6,6 +6,8 @@ LORA_R=32
 LORA_A=64
 BATCH_SIZE=12
 GRADIENT_ACCUMULATION_STEPS=1
+NUM_TRAIN_EPOCHS=1
+PERCENT_DATA=1.0
 
 KD_WEIGHT=1.0
 W_LOSS_CKA=1.0
@@ -17,6 +19,8 @@ W_LOSS_CROSS=1.0
 # Semantic Grounding Distillation — direct KL on G_vt vision–text affinity
 W_LOSS_GROUNDING=0.5
 SEKD_GROUNDING_TEMP=0.1
+# Grounding weight warmup: 15% tổng optimizer steps (tính trong main.py từ max_train_steps)
+W_LOSS_GROUNDING_WARMUP_RATIO=0.15
 
 # SEKD hyperparameters
 SEKD_K_MIN=2
@@ -58,12 +62,12 @@ torchrun --standalone --nproc_per_node=$NUM_GPUS_PER_NODE $TRAIN_SCRIPT \
     --subset_name "${SUBSETS[@]}" \
     --dataset_split "original" \
     --image_dir "vlm2vec_train/MMEB-train" \
-    --percent_data 1.0 \
+    --percent_data $PERCENT_DATA \
     --output_dir "training/$EXP_NAME" \
     --per_device_train_batch_size $BATCH_SIZE \
     --gradient_accumulation_steps $GRADIENT_ACCUMULATION_STEPS \
     --learning_rate 1e-4 \
-    --num_train_epochs 1 \
+    --num_train_epochs $NUM_TRAIN_EPOCHS \
     --bf16 \
     --save_total_limit 2 \
     --logging_steps 5 \
@@ -82,6 +86,7 @@ torchrun --standalone --nproc_per_node=$NUM_GPUS_PER_NODE $TRAIN_SCRIPT \
     --w_loss_t $W_LOSS_T \
     --w_loss_cross $W_LOSS_CROSS \
     --w_loss_grounding $W_LOSS_GROUNDING \
+    --w_loss_grounding_warmup_ratio $W_LOSS_GROUNDING_WARMUP_RATIO \
     --sekd_grounding_temp $SEKD_GROUNDING_TEMP \
     --knn_neighbors $KNN_NEIGHBORS \
     --sekd_k_min $SEKD_K_MIN \

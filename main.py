@@ -52,6 +52,20 @@ def is_segd_loss(training_args: TrainingArguments) -> bool:
     return training_args.kd_loss_type == "segd_loss"
 
 
+def resolve_grounding_warmup_steps(
+    training_args: TrainingArguments,
+    max_train_steps: int,
+) -> int:
+    """Explicit warmup_steps wins; else ratio × total optimizer steps."""
+    steps = int(training_args.w_loss_grounding_warmup_steps)
+    if steps > 0:
+        return steps
+    ratio = float(getattr(training_args, "w_loss_grounding_warmup_ratio", 0.0))
+    if ratio <= 0 or max_train_steps <= 0:
+        return 0
+    return max(1, int(max_train_steps * ratio))
+
+
 # Full metric keys for logger / wandb (subset names without train/ prefix).
 KD_LOSS_METRIC_KEYS: Dict[str, Tuple[str, ...]] = {
     "sgd_loss": (
@@ -78,6 +92,8 @@ KD_LOSS_METRIC_KEYS: Dict[str, Tuple[str, ...]] = {
         "grounding_loss",
         "grounding_loss_qry",
         "grounding_loss_pos",
+        "grounding_weight_effective",
+        "grounding_to_segd_ratio",
         "batch_vision_nodes_qry",
         "batch_text_nodes_qry",
         "batch_vision_nodes_pos",
@@ -659,6 +675,11 @@ def main():
     lr_scheduler = build_lr_scheduler(optimizer, training_args, max_train_steps)
 
     criterion = build_criterion(training_args).to(device)
+    if hasattr(criterion, "configure_grounding_warmup"):
+        grounding_warmup_steps = resolve_grounding_warmup_steps(
+            training_args, max_train_steps
+        )
+        criterion.configure_grounding_warmup(grounding_warmup_steps)
     nan_debugger = TrainNanDebugger(distiller)
 
     # Training Stats
@@ -670,6 +691,10 @@ def main():
         logger.info(f"  Num Epochs = {training_args.num_train_epochs}")
         logger.info(f"  Gradient Accumulation steps = {training_args.gradient_accumulation_steps}")
         logger.info(f"  Total optimization steps = {max_train_steps}")
+        if hasattr(criterion, "w_loss_grounding_warmup_steps"):
+            logger.info(
+                f"  Grounding warmup steps = {criterion.w_loss_grounding_warmup_steps}"
+            )
         logger.info(f"  Val split ratio = {data_args.val_split_ratio}")
         logger.info(f"  Eval step = {training_args.eval_steps}")
         logger.info(f"  Output dir = {training_args.output_dir}")
@@ -696,6 +721,9 @@ def main():
             step_num = global_step + 1
             epoch_step = step + 1
             nan_debugger.annotate_step(training_args, step_num, epoch_step)
+
+            if hasattr(criterion, "set_training_step"):
+                criterion.set_training_step(global_step)
 
             outputs = distiller(criterion, batch)
             loss = outputs["loss"] / training_args.gradient_accumulation_steps
