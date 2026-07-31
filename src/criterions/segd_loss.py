@@ -874,6 +874,12 @@ class SEGDLoss(nn.Module):
             "grounding_valid": 0.0,
             "k_g_sum": 0.0,
             "k_g_count": 0.0,
+            "k_g_v_sum": 0.0,
+            "k_g_v_count": 0.0,
+            "k_g_t_sum": 0.0,
+            "k_g_t_count": 0.0,
+            "k_g_vt_sum": 0.0,
+            "k_g_vt_count": 0.0,
         }
 
         losses: List[torch.Tensor] = []
@@ -926,6 +932,8 @@ class SEGDLoss(nn.Module):
                 stats["loss_v"] = loss_v.float()
                 stats["k_g_sum"] += float(k_g_v)
                 stats["k_g_count"] += 1.0
+                stats["k_g_v_sum"] += float(k_g_v)
+                stats["k_g_v_count"] += 1.0
 
         # ===== G_t =====
         if (
@@ -952,6 +960,8 @@ class SEGDLoss(nn.Module):
                 stats["loss_t"] = loss_t.float()
                 stats["k_g_sum"] += float(k_g_t)
                 stats["k_g_count"] += 1.0
+                stats["k_g_t_sum"] += float(k_g_t)
+                stats["k_g_t_count"] += 1.0
 
         # ===== G_vt (bipartite) + Semantic Grounding =====
         c_t_vt: Optional[torch.Tensor] = None
@@ -1022,6 +1032,8 @@ class SEGDLoss(nn.Module):
                     stats["loss_cross"] = loss_vt.float()
                     stats["k_g_sum"] += float(k_g_vt)
                     stats["k_g_count"] += 1.0
+                    stats["k_g_vt_sum"] += float(k_g_vt)
+                    stats["k_g_vt_count"] += 1.0
 
         if not losses:
             segd_loss = self._zero(device, dtype)
@@ -1209,6 +1221,12 @@ class SEGDLoss(nn.Module):
             "grounding_valid_samples": 0.0,
             "k_g_sum": 0.0,
             "k_g_count": 0.0,
+            "k_g_v_sum": 0.0,
+            "k_g_v_count": 0.0,
+            "k_g_t_sum": 0.0,
+            "k_g_t_count": 0.0,
+            "k_g_vt_sum": 0.0,
+            "k_g_vt_count": 0.0,
         }
 
         for i in range(batch_size):
@@ -1242,6 +1260,12 @@ class SEGDLoss(nn.Module):
             agg["graph_vt"] += stats_i["graph_vt"]
             agg["k_g_sum"] += stats_i["k_g_sum"]
             agg["k_g_count"] += stats_i["k_g_count"]
+            agg["k_g_v_sum"] += stats_i["k_g_v_sum"]
+            agg["k_g_v_count"] += stats_i["k_g_v_count"]
+            agg["k_g_t_sum"] += stats_i["k_g_t_sum"]
+            agg["k_g_t_count"] += stats_i["k_g_t_count"]
+            agg["k_g_vt_sum"] += stats_i["k_g_vt_sum"]
+            agg["k_g_vt_count"] += stats_i["k_g_vt_count"]
             if stats_i["grounding_valid"] > 0:
                 grounding_losses.append(grounding_i)
                 agg["grounding_valid_samples"] += 1.0
@@ -1429,6 +1453,20 @@ class SEGDLoss(nn.Module):
         k_g_sum = stats_qry["k_g_sum"] + stats_pos["k_g_sum"]
         mean_k_g = k_g_sum / max(k_g_count, 1.0)
 
+        def _mean_k_g_by_type(
+            stats_dict: Dict[str, object], graph: str,
+        ) -> float:
+            sum_key = f"k_g_{graph}_sum"
+            count_key = f"k_g_{graph}_count"
+            return float(stats_dict[sum_key]) / max(float(stats_dict[count_key]), 1.0)
+
+        def _combined_mean_k_g(graph: str) -> float:
+            sum_key = f"k_g_{graph}_sum"
+            count_key = f"k_g_{graph}_count"
+            total_sum = float(stats_qry[sum_key]) + float(stats_pos[sum_key])
+            total_count = float(stats_qry[count_key]) + float(stats_pos[count_key])
+            return total_sum / max(total_count, 1.0)
+
         def _metric(v: float) -> torch.Tensor:
             return torch.tensor(v, device=device, dtype=torch.float32)
 
@@ -1469,4 +1507,13 @@ class SEGDLoss(nn.Module):
             "sekd_mean_k_g_pos": _metric(
                 stats_pos["k_g_sum"] / max(stats_pos["k_g_count"], 1.0)
             ),
+            "sekd_mean_k_g_v": _metric(_combined_mean_k_g("v")),
+            "sekd_mean_k_g_t": _metric(_combined_mean_k_g("t")),
+            "sekd_mean_k_g_vt": _metric(_combined_mean_k_g("vt")),
+            "sekd_mean_k_g_v_qry": _metric(_mean_k_g_by_type(stats_qry, "v")),
+            "sekd_mean_k_g_t_qry": _metric(_mean_k_g_by_type(stats_qry, "t")),
+            "sekd_mean_k_g_vt_qry": _metric(_mean_k_g_by_type(stats_qry, "vt")),
+            "sekd_mean_k_g_v_pos": _metric(_mean_k_g_by_type(stats_pos, "v")),
+            "sekd_mean_k_g_t_pos": _metric(_mean_k_g_by_type(stats_pos, "t")),
+            "sekd_mean_k_g_vt_pos": _metric(_mean_k_g_by_type(stats_pos, "vt")),
         }
