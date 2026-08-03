@@ -49,6 +49,8 @@ class LlavaQwen2OutputWithPast(ModelOutput):
     hidden_states: Optional[tuple[torch.FloatTensor, ...]] = None
     attentions: Optional[tuple[torch.FloatTensor, ...]] = None
     batch_image_embeds: Optional[List[torch.FloatTensor]] = None
+    # Expanded mask after image-token insertion (matches hidden_states seq length).
+    attention_mask: Optional[torch.Tensor] = None
     
 
 class LlavaQwen2ForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
@@ -125,7 +127,8 @@ class LlavaQwen2ForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             past_key_values=output.past_key_values,
             hidden_states=output.hidden_states,
             attentions=output.attentions,
-            batch_image_embeds=image_features
+            batch_image_embeds=image_features,
+            attention_mask=attention_mask,
         )
             
 

@@ -194,13 +194,32 @@ def _fallback_attn_from_embeddings(h: torch.Tensor) -> torch.Tensor:
 # Graph construction (star-bridge)
 # ---------------------------------------------------------------------------
 
-def topk_sparsify(w: torch.Tensor, k: int) -> torch.Tensor:
-    if w.shape[0] <= k:
-        return w
-    vals, idx = w.topk(k, dim=1)
-    out = torch.zeros_like(w)
-    out.scatter_(1, idx, vals)
-    return out
+def _cosine_softmax_weight(
+    x_i: torch.Tensor, x_candidates: torch.Tensor, tau: float,
+) -> torch.Tensor:
+    """Softmax(cosine/tau) over candidates; positive weights summing to 1."""
+    tau = max(float(tau), _EPS)
+    xi_n = F.normalize(x_i.float(), dim=-1)
+    xc_n = F.normalize(x_candidates.float(), dim=-1)
+    logits = (xc_n @ xi_n) / tau
+    return torch.softmax(logits, dim=0)
+
+
+def _build_attn_topk_index(
+    attn: torch.Tensor, mask: torch.Tensor, k: int = 16,
+) -> torch.Tensor:
+    """Attention values only select neighbor indices (not edge weights)."""
+    valid = mask.bool()
+    a = attn.float()
+    a = a.masked_fill(~valid.unsqueeze(0), float("-inf"))
+    a = a.masked_fill(~valid.unsqueeze(1), float("-inf"))
+    a = a.clone()
+    a.fill_diagonal_(float("-inf"))
+    k_eff = min(k, int(valid.sum().item()) - 1)
+    if k_eff <= 0:
+        return torch.empty(attn.size(0), 0, device=attn.device, dtype=torch.long)
+    _, topk_idx = a.topk(k_eff, dim=1)
+    return topk_idx
 
 
 def mean_pool(tokens: torch.Tensor, mask: torch.Tensor, eps: float = _EPS) -> torch.Tensor:
@@ -255,40 +274,49 @@ class _DiffEdgeBuffer:
             sp = torch.sparse_coo_tensor(
                 indices, values, (n_total, n_total), device=self.device,
             ).coalesce()
-        return sp.to_dense()
+        w = sp.to_dense()
+        return 0.5 * (w + w.t())
 
 
 def _intra_cluster_edges(
     edges: _DiffEdgeBuffer,
     attn: torch.Tensor,
+    hidden: torch.Tensor,
     mask: torch.Tensor,
     start_idx: int,
     topk: int = 16,
+    tau: float = 0.1,
 ) -> None:
-    m = mask.to(dtype=attn.dtype)
-    a = attn.float() * m.unsqueeze(0) * m.unsqueeze(1)
-    w_local = 0.5 * (a + a.t())
-    w_local = w_local.clone()
-    w_local.fill_diagonal_(0.0)
-    # top-k per row breaks symmetry — re-symmetrize so signed Laplacian stays PSD.
-    w_local = topk_sparsify(w_local, k=topk)
-    w_local = 0.5 * (w_local + w_local.t())
-    nz_r, nz_c = w_local.nonzero(as_tuple=True)
-    for r, c in zip(nz_r.tolist(), nz_c.tolist()):
-        edges.add(start_idx + r, start_idx + c, w_local[r, c], symmetric=False)
+    with torch.no_grad():
+        topk_idx = _build_attn_topk_index(attn, mask, k=topk)
+    if topk_idx.numel() == 0:
+        return
+    for i in range(hidden.size(0)):
+        if not bool(mask[i]):
+            continue
+        neighbors = topk_idx[i]
+        w = _cosine_softmax_weight(hidden[i], hidden[neighbors], tau)
+        for rank, j in enumerate(neighbors.tolist()):
+            if not bool(mask[j]):
+                continue
+            edges.add(start_idx + i, start_idx + j, w[rank], symmetric=False)
 
 
 def _local_to_global_edges(
     edges: _DiffEdgeBuffer,
+    hidden: torch.Tensor,
     mask: torch.Tensor,
+    r: torch.Tensor,
     start_idx: int,
     super_idx: int,
+    tau: float = 0.1,
 ) -> None:
-    n_valid = mask.sum().clamp_min(1).to(dtype=torch.float32)
-    weight = 1.0 / n_valid
-    for t in range(mask.numel()):
-        if bool(mask[t]):
-            edges.add(start_idx + t, super_idx, weight, symmetric=True)
+    valid_idx = mask.nonzero(as_tuple=True)[0]
+    if valid_idx.numel() == 0:
+        return
+    w = _cosine_softmax_weight(r, hidden[valid_idx], tau)
+    for rank, t in enumerate(valid_idx.tolist()):
+        edges.add(start_idx + t, super_idx, w[rank], symmetric=True)
 
 
 def _bridge_edges(
@@ -297,7 +325,6 @@ def _bridge_edges(
     r_p: torch.Tensor,
     idx_rq: Sequence[int],
     idx_rp: Sequence[int],
-    d_model: int,
     k_neg: int = 8,
     temperature: float = 1.0,
     lambda_neg: float = 0.3,
@@ -305,8 +332,9 @@ def _bridge_edges(
     b = r_q.size(0)
     if b == 0:
         return
-    scale = 1.0 / math.sqrt(max(d_model, 1))
-    logits = (r_q.float() @ r_p.float().t()) * scale / max(temperature, _EPS)
+    r_q_n = F.normalize(r_q.float(), dim=-1)
+    r_p_n = F.normalize(r_p.float(), dim=-1)
+    logits = (r_q_n @ r_p_n.t()) / max(temperature, _EPS)
 
     for i in range(b):
         row = logits[i]
@@ -339,8 +367,9 @@ def assemble_graph(
     attn_p: List[torch.Tensor],
     mask_q: List[torch.Tensor],
     mask_p: List[torch.Tensor],
-    d_model: int,
     topk: int = 16,
+    tau_intra: float = 0.1,
+    tau_local: float = 0.1,
     k_neg: int = 8,
     bridge_temperature: float = 1.0,
     lambda_neg: float = 0.3,
@@ -364,17 +393,29 @@ def assemble_graph(
 
     for i in range(b):
         q_start, p_start = offsets["q"][i], offsets["p"][i]
-        _intra_cluster_edges(edges, attn_q[i], mask_q[i], q_start, topk=topk)
-        _intra_cluster_edges(edges, attn_p[i], mask_p[i], p_start, topk=topk)
-        _local_to_global_edges(edges, mask_q[i], q_start, idx_rq[i])
-        _local_to_global_edges(edges, mask_p[i], p_start, idx_rp[i])
-        r_q_all.append(mean_pool(matched_q[i], mask_q[i]))
-        r_p_all.append(mean_pool(matched_p[i], mask_p[i]))
+        r_q = mean_pool(matched_q[i], mask_q[i])
+        r_p = mean_pool(matched_p[i], mask_p[i])
+        r_q_all.append(r_q)
+        r_p_all.append(r_p)
+        _intra_cluster_edges(
+            edges, attn_q[i], matched_q[i], mask_q[i], q_start,
+            topk=topk, tau=tau_intra,
+        )
+        _intra_cluster_edges(
+            edges, attn_p[i], matched_p[i], mask_p[i], p_start,
+            topk=topk, tau=tau_intra,
+        )
+        _local_to_global_edges(
+            edges, matched_q[i], mask_q[i], r_q, q_start, idx_rq[i], tau=tau_local,
+        )
+        _local_to_global_edges(
+            edges, matched_p[i], mask_p[i], r_p, p_start, idx_rp[i], tau=tau_local,
+        )
 
     r_q = torch.stack(r_q_all, dim=0)
     r_p = torch.stack(r_p_all, dim=0)
     _bridge_edges(
-        edges, r_q, r_p, idx_rq, idx_rp, d_model,
+        edges, r_q, r_p, idx_rq, idx_rp,
         k_neg=k_neg, temperature=bridge_temperature, lambda_neg=lambda_neg,
     )
     return edges.to_dense(n_total), n_total, r_q, r_p
@@ -649,6 +690,8 @@ class SEGDLoss(nn.Module):
         self.depth_ratio = float(getattr(args, "segd_depth_ratio", 0.8))
         self.attn_window = int(getattr(args, "segd_attn_window", 1))
         self.intra_topk = int(getattr(args, "segd_intra_topk", 16))
+        self.tau_intra = float(getattr(args, "segd_tau_intra", 0.1))
+        self.tau_local = float(getattr(args, "segd_tau_local", 0.1))
         self.lambda_neg = float(getattr(args, "segd_lambda_neg", 0.3))
         self.k_neg = int(getattr(args, "segd_k_neg", 8))
         self.bridge_temperature = float(getattr(args, "segd_bridge_temperature", 1.0))
@@ -1066,20 +1109,23 @@ class SEGDLoss(nn.Module):
             batch_size=batch_size,
         )
 
-        d_model_s = int(s_mq[0].size(-1))
-        d_model_t = int(t_mq[0].size(-1))
-
         # ----- Assemble independent graphs -----
         with torch.no_grad():
             w_t, n_t, _rq_t, _rp_t = assemble_graph(
-                t_mq, t_mp, t_aq, t_ap, t_msq, t_msp, d_model_t,
-                topk=self.intra_topk, k_neg=self.k_neg,
+                t_mq, t_mp, t_aq, t_ap, t_msq, t_msp,
+                topk=self.intra_topk,
+                tau_intra=self.tau_intra,
+                tau_local=self.tau_local,
+                k_neg=self.k_neg,
                 bridge_temperature=self.bridge_temperature,
                 lambda_neg=self.lambda_neg,
             )
         w_s, n_s, rq_s, rp_s = assemble_graph(
-            s_mq, s_mp, s_aq, s_ap, s_msq, s_msp, d_model_s,
-            topk=self.intra_topk, k_neg=self.k_neg,
+            s_mq, s_mp, s_aq, s_ap, s_msq, s_msp,
+            topk=self.intra_topk,
+            tau_intra=self.tau_intra,
+            tau_local=self.tau_local,
+            k_neg=self.k_neg,
             bridge_temperature=self.bridge_temperature,
             lambda_neg=self.lambda_neg,
         )
@@ -1131,21 +1177,49 @@ class SEGDLoss(nn.Module):
         )
 
         total_loss = c_loss + self.kd_weight * kd_loss
+        kd_weighted = self.kd_weight * kd_loss
 
         def _metric(v: float) -> torch.Tensor:
             return torch.tensor(v, device=device, dtype=torch.float32)
 
+        # Per-side cluster sizes (sum over batch); super-nodes = 2B (RQ + RP).
+        n_q_sum_t = float(sum(n_q_t))
+        n_p_sum_t = float(sum(n_p_t))
+        n_q_sum_s = float(sum(n_q_s))
+        n_p_sum_s = float(sum(n_p_s))
+
         return {
+            # ----- loss components -----
             "loss": total_loss,
             "contrastive_loss": c_loss.detach(),
             "segd_loss": kd_loss.detach(),
             "spectral_kd_loss": kd_loss.detach(),
+            "kd_weighted": kd_weighted.detach(),
+            "kd_weight": _metric(self.kd_weight),
+            # ----- graph size (batch-level) -----
+            "batch_size": _metric(float(batch_size)),
             "n_total_teacher": _metric(float(n_t)),
             "n_total_student": _metric(float(n_s)),
+            "n_supernodes": _metric(float(2 * batch_size)),
+            # Teacher nodes
+            "t_vision_nodes_qry": _metric(t_stats["vision_nodes_q"]),
+            "t_text_nodes_qry": _metric(t_stats["text_nodes_q"]),
+            "t_vision_nodes_pos": _metric(t_stats["vision_nodes_p"]),
+            "t_text_nodes_pos": _metric(t_stats["text_nodes_p"]),
+            "t_cluster_nodes_qry": _metric(n_q_sum_t),
+            "t_cluster_nodes_pos": _metric(n_p_sum_t),
+            # Student nodes (aliases keep prior wandb keys)
             "batch_vision_nodes_qry": _metric(s_stats["vision_nodes_q"]),
             "batch_text_nodes_qry": _metric(s_stats["text_nodes_q"]),
             "batch_vision_nodes_pos": _metric(s_stats["vision_nodes_p"]),
             "batch_text_nodes_pos": _metric(s_stats["text_nodes_p"]),
+            "s_vision_nodes_qry": _metric(s_stats["vision_nodes_q"]),
+            "s_text_nodes_qry": _metric(s_stats["text_nodes_q"]),
+            "s_vision_nodes_pos": _metric(s_stats["vision_nodes_p"]),
+            "s_text_nodes_pos": _metric(s_stats["text_nodes_p"]),
+            "s_cluster_nodes_qry": _metric(n_q_sum_s),
+            "s_cluster_nodes_pos": _metric(n_p_sum_s),
+            # ----- spectral / layer -----
             "segd_attn_layer": _metric(s_stats["attn_layer_center"]),
             "segd_k_eigen": _metric(float(min(self.k_eigen, u_s.size(1)))),
         }

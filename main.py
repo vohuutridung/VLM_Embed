@@ -87,8 +87,24 @@ KD_LOSS_METRIC_KEYS: Dict[str, Tuple[str, ...]] = {
         "contrastive_loss",
         "segd_loss",
         "spectral_kd_loss",
+        "kd_weighted",
+        "kd_weight",
+        "batch_size",
         "n_total_teacher",
         "n_total_student",
+        "n_supernodes",
+        "t_vision_nodes_qry",
+        "t_text_nodes_qry",
+        "t_vision_nodes_pos",
+        "t_text_nodes_pos",
+        "t_cluster_nodes_qry",
+        "t_cluster_nodes_pos",
+        "s_vision_nodes_qry",
+        "s_text_nodes_qry",
+        "s_vision_nodes_pos",
+        "s_text_nodes_pos",
+        "s_cluster_nodes_qry",
+        "s_cluster_nodes_pos",
         "batch_vision_nodes_qry",
         "batch_text_nodes_qry",
         "batch_vision_nodes_pos",
@@ -162,21 +178,55 @@ def init_wandb(
     model_args: ModelArguments,
     data_args: DataArguments,
 ) -> None:
-    """Initialize W&B (cloud only, no terminal output)."""
+    """Initialize W&B (cloud only, no terminal console capture)."""
     api_key = training_args.wandb_api_key or os.getenv("WANDB_API_KEY")
     if api_key:
         wandb.login(key=api_key, relogin=True)
-    wandb.init(
-        project=os.getenv("WANDB_PROJECT", "vlm_distillation_segd"),
+    project = (
+        getattr(training_args, "project_name", None)
+        or os.getenv("WANDB_PROJECT")
+        or "vlm_distillation_segd_nothing"
+    )
+    run = wandb.init(
+        project=project,
         name=training_args.run_name or f"run-{int(time.time())}",
         config={
             "model_args": vars(model_args),
             "data_args": vars(data_args),
-            "training_args": vars(training_args),
+            "training_args": {
+                k: v for k, v in vars(training_args).items()
+                if k not in ("wandb_api_key", "distributed_state", "__cached__setup_devices", "deepspeed_plugin")
+            },
         },
         settings=wandb.Settings(console="off"),
+        reinit=True,
     )
-    logger.info("W&B initialized (metrics only; console output disabled).")
+    # Smoke-check that history upload works (visible immediately on the run page).
+    wandb.log({"train/wandb_ready": 1}, step=0)
+    logger.info(
+        "W&B initialized (metrics only; console output disabled). "
+        f"project={project} run={run.name} id={run.id} url={run.url}"
+    )
+
+
+def log_wandb_metrics(metrics: dict, step: int) -> None:
+    """Log metrics to the active W&B run; warn instead of failing training."""
+    if wandb.run is None:
+        logger.warning(f"wandb.log skipped at step={step}: no active wandb.run")
+        return
+    try:
+        # Ensure JSON-serializable floats only
+        clean = {}
+        for k, v in metrics.items():
+            if isinstance(v, torch.Tensor):
+                clean[k] = float(v.detach().cpu().item())
+            elif isinstance(v, (float, int)):
+                clean[k] = float(v)
+            else:
+                continue
+        wandb.log(clean, step=step)
+    except Exception as exc:
+        logger.warning(f"wandb.log failed at step={step}: {exc}")
 
 
 def configure_student_params(distiller: Distiller, training_args: TrainingArguments) -> None:
@@ -500,7 +550,7 @@ def run_validation(
     if is_main_process():
         logger.info(format_eval_log_line(global_step, epoch, eval_metrics))
         if use_wandb_logging:
-            wandb.log(eval_metrics, step=global_step)
+            log_wandb_metrics(eval_metrics, global_step)
 
         if val_loss < best_val_loss:
             logger.info(
@@ -771,7 +821,7 @@ def main():
                     )
                     logger.info(detail_line)
                     if wandb_enabled:
-                        wandb.log(metrics, step=global_step)
+                        log_wandb_metrics(metrics, global_step)
 
                 # Periodic validation
                 eval_steps = training_args.eval_steps or 0

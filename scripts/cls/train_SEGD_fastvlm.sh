@@ -5,7 +5,7 @@ NUM_GPUS_PER_NODE=1
 LORA_R=32
 LORA_A=64
 # Star-bridge batch graph is O((B·N_tok)^2); start small then scale
-BATCH_SIZE=4
+BATCH_SIZE=16
 GRADIENT_ACCUMULATION_STEPS=4
 NUM_TRAIN_EPOCHS=1
 PERCENT_DATA=1.0
@@ -16,6 +16,8 @@ KD_WEIGHT=1.0
 SEGD_DEPTH_RATIO=0.8
 SEGD_ATTN_WINDOW=1
 SEGD_INTRA_TOPK=16
+SEGD_TAU_INTRA=0.1
+SEGD_TAU_LOCAL=0.1
 SEGD_LAMBDA_NEG=0.3
 SEGD_K_NEG=8
 SEGD_BRIDGE_TEMPERATURE=1.0
@@ -74,6 +76,8 @@ torchrun --standalone --nproc_per_node=$NUM_GPUS_PER_NODE $TRAIN_SCRIPT \
     --segd_depth_ratio $SEGD_DEPTH_RATIO \
     --segd_attn_window $SEGD_ATTN_WINDOW \
     --segd_intra_topk $SEGD_INTRA_TOPK \
+    --segd_tau_intra $SEGD_TAU_INTRA \
+    --segd_tau_local $SEGD_TAU_LOCAL \
     --segd_lambda_neg $SEGD_LAMBDA_NEG \
     --segd_k_neg $SEGD_K_NEG \
     --segd_bridge_temperature $SEGD_BRIDGE_TEMPERATURE \
@@ -83,6 +87,7 @@ torchrun --standalone --nproc_per_node=$NUM_GPUS_PER_NODE $TRAIN_SCRIPT \
     --student_patch_size 64 \
     --image_resolution "low" \
     --report_to "wandb" \
+    --project_name "vlm_distillation_segd_nothing" \
     --run_name "$EXP_NAME"
 
 echo "========================================================="

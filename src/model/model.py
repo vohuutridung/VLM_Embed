@@ -11,7 +11,8 @@ from src.model.processor import LLAVA_NEXT, QWEN2_VL, PHI3V, get_backbone_name, 
 
 from src.arguments import ModelArguments
 from src.model.processor import LLAVA_NEXT, QWEN2_VL, PHI3V, get_backbone_name, print_master, QWEN2_5_VL, \
-    QWEN2_VL_TOKENSELECTION, backbone2model, GME, VLM_IMAGE_TOKENS, LamRA, COLPALI, INTERN_VL3, LLAVA_ONEVISION
+    QWEN2_VL_TOKENSELECTION, backbone2model, GME, VLM_IMAGE_TOKENS, LamRA, COLPALI, INTERN_VL3, LLAVA_ONEVISION, \
+    LLAVA_QWEN2
 from src.model.vlm_backbone.colpali import ColPali
 from src.model.vlm_backbone.gme.gme_inference import GmeQwen2VL
 from src.model.vlm_backbone.lamra.lamra_inference import LamRAQwen2VL
@@ -125,7 +126,8 @@ class MMEBModel(nn.Module):
             output_hidden_states = hidden_states.hidden_states
             last_hidden_state = hidden_states.hidden_states[-1]
             attention_matrix = hidden_states.attentions if output_attentions and hasattr(hidden_states, 'attentions') else None
-            pooled_output = self._pooling(last_hidden_state, input['attention_mask'])
+            pool_mask = self._resolve_pool_mask(last_hidden_state, input, hidden_states)
+            pooled_output = self._pooling(last_hidden_state, pool_mask)
             return pooled_output, image_features, attention_matrix, output_hidden_states
         elif getattr(self, "model_backbone", None) in [LLAVA_QWEN2, QWEN2_VL]:
             # print("Encoding input for FastVLM model backbone")
@@ -137,7 +139,8 @@ class MMEBModel(nn.Module):
             output_hidden_states = hidden_states.hidden_states
             last_hidden_state = hidden_states.hidden_states[-1]
             attention_matrix = hidden_states.attentions if output_attentions and hasattr(hidden_states, 'attentions') else None
-            pooled_output = self._pooling(last_hidden_state, input['attention_mask'])
+            pool_mask = self._resolve_pool_mask(last_hidden_state, input, hidden_states)
+            pooled_output = self._pooling(last_hidden_state, pool_mask)
 
             return pooled_output, image_features, attention_matrix, output_hidden_states
         else:
@@ -150,9 +153,10 @@ class MMEBModel(nn.Module):
             output_hidden_states = hidden_states.hidden_states
             last_hidden_state = hidden_states.hidden_states[-1]
             attention_matrix = hidden_states.attentions if output_attentions and hasattr(hidden_states, 'attentions') else None
-            pooled_output = self._pooling(last_hidden_state, input['attention_mask'])
+            pool_mask = self._resolve_pool_mask(last_hidden_state, input, hidden_states)
+            pooled_output = self._pooling(last_hidden_state, pool_mask)
 
-            all_layers_embeds = torch.stack([self._pooling(hidden_state, input['attention_mask']) 
+            all_layers_embeds = torch.stack([self._pooling(hidden_state, pool_mask)
                                             for hidden_state in hidden_states.hidden_states]).permute(1, 0, 2)
             
             return pooled_output, image_features, attention_matrix, output_hidden_states
@@ -164,6 +168,37 @@ class MMEBModel(nn.Module):
             - image_features: (batch, num_image_tokens, embed_dim), 
             - attention_matrix: list of (batch, num_heads, num_tokens, num_tokens)
         """
+
+    def _resolve_pool_mask(self, last_hidden_state, input, model_output=None):
+        """
+        Prefer the post-multimodal (expanded) attention mask when available.
+
+        LLaVA/FastVLM replaces the image placeholder with many patch tokens, so
+        ``input['attention_mask']`` (pre-expand) no longer matches
+        ``last_hidden_state`` seq length. The encoder forward returns the expanded
+        mask on the output when supported.
+        """
+        seq_len = last_hidden_state.size(1)
+        candidates = []
+        if model_output is not None and getattr(model_output, "attention_mask", None) is not None:
+            candidates.append(model_output.attention_mask)
+        if isinstance(input, dict) and input.get("attention_mask", None) is not None:
+            candidates.append(input["attention_mask"])
+
+        for mask in candidates:
+            if mask is None:
+                continue
+            if mask.dim() == 2 and mask.size(1) == seq_len:
+                return mask
+
+        # Fallback: treat all expanded positions as valid (no pad info available).
+        return torch.ones(
+            last_hidden_state.size(0),
+            seq_len,
+            device=last_hidden_state.device,
+            dtype=torch.long,
+        )
+
     def _pooling(self, last_hidden_state, attention_mask):
         if self.pooling == 'last' or self.pooling == 'eos':
             left_padding = (attention_mask[:, -1].sum() == attention_mask.shape[0])

@@ -161,7 +161,15 @@ class TrainingArguments(TrainingArguments):
     )
     segd_intra_topk: int = field(
         default=16,
-        metadata={"help": "top-k neighbors per token for intra-cluster attention sparsify"},
+        metadata={"help": "top-k neighbors per token for intra-cluster (attention selects index only)"},
+    )
+    segd_tau_intra: float = field(
+        default=0.1,
+        metadata={"help": "softmax temperature for intra-cluster cosine edge weights"},
+    )
+    segd_tau_local: float = field(
+        default=0.1,
+        metadata={"help": "softmax temperature for local-to-global cosine edge weights"},
     )
     segd_lambda_neg: float = field(
         default=0.3,

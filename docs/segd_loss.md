@@ -132,7 +132,7 @@ $$
 A^{\text{cluster}} = A[\mathcal{I}, \mathcal{I}], \quad \mathcal{I} = \mathcal{I}^{\text{vis}} \cup \mathcal{I}^{\text{txt}}
 $$
 
-Không pool / coarsen $A$ trước slice — đây là attention **native** trên đúng token đã forward.
+Không pool / coarsen $A$ trước slice — đây là attention **native** trên đúng token đã forward. $A^{\text{cluster}}$ chỉ dùng để **chọn top-k neighbor**; trọng số cạnh intra tính từ **hidden states** cùng layer window (mục 3.2).
 
 ### 1A.2 Infer lưới vision $(H, W)$ từ $N_v$
 
@@ -352,7 +352,7 @@ Forward native ──► Graph W (index native) ──► L ──► U
 |------|-------|--------|---------|
 | Extract tokens | `hidden_states` @ ~80% window | $h_v, h_t$ native | Mỗi (sample, qry/pos, model) |
 | Slice attention | full-seq $A$ @ cùng window | $A^{\text{cluster}}$ | Build $W$ intra |
-| Build $W$ | tokens, $A$ | $W \in \mathbb{R}^{N\times N}$ | Per model, batch |
+| Build $W$ | hidden, $A$ (topology), $R$ | $W \in \mathbb{R}^{N\times N}$ | Per model, batch; cosine softmax weights |
 | Eigendecomp | $L$ | $U \in \mathbb{R}^{N\times k}$ | Per model |
 | Build $P$ | spans, $(H,W)$, offsets | $P \in \mathbb{R}^{N_T \times N_S}$ | **Sau** eigh, chỉ KD |
 | Project | $U_t, P$ | $U_t^{\mathrm{proj}} = P^{\top} U_t$ | KD loss |
@@ -375,7 +375,7 @@ attn   = mean(mean_heads(attentions[i]) for i in idxs)  # (B, S, S)
 
 Layer cuối thường spike vào CLS/EOS → graph gần rời rạc nếu dùng attention cuối; hidden cuối cũng sharpen khác ~80%.
 
-**Không** pool / coarsen attention trước slice cluster. Nếu `attentions is None` → fallback softmax cosine trên **cùng** hidden @ ~80%.
+**Không** pool / coarsen attention trước slice cluster. Nếu `attentions is None` → fallback: dùng **cosine similarity** trên cùng hidden @ ~80% để chọn top-k neighbor (vẫn weight bằng cosine softmax trên hidden).
 
 Metric log: `segd_attn_layer` = layer center của window (từ attention path nếu có, else từ hidden path).
 
@@ -460,29 +460,74 @@ N_v + j & \text{text subword } j
 \end{cases}
 $$
 
-### 3.2 Ba loại cạnh — ba nguồn trọng số
+### 3.2 Nguyên tắc gán trọng số cạnh
 
-| Cạnh | Giữa | Trọng số |
-|------|------|----------|
-| Intra-cluster | token ↔ token (cùng cụm) | Attention thật @ ~80%, symmetrize → top-k → **re-symmetrize** (giữ PSD) |
-| Local-to-global | token ↔ super-node cụm | Cố định $1/n_{\text{valid}}$ (định nghĩa mean-pool) |
-| Bridge | $R_Q$ ↔ $\{R_P, R_{\text{Neg}}\}$ | Softmax scaled-dot-product trên $\{pos, top\text{-}k\ \text{hard neg}\}$; pos $+α$, neg $-λ_{\text{neg}}α$ |
+> **Attention determines graph topology, while cosine similarity determines edge affinity.**
+
+Attention (forward pass, layer ~80% depth) **chỉ dùng để chọn tập hàng xóm** (neighbor selection) cho cạnh intra-cluster. **Toàn bộ trọng số cạnh** — cả 3 loại (intra-cluster, local-to-global, bridge) — đều tính lại bằng **cosine similarity + softmax normalize cục bộ** trên đúng tập candidate của node đó. Không có nơi nào dùng attention hay hằng số $1/n$ làm giá trị cạnh cuối cùng.
+
+**Lý do:**
+1. **Cân bằng scale** — cả 3 loại cạnh đều là $\mathrm{softmax}(\cos/\tau)$ trên candidate set riêng → cùng bậc magnitude, không cần hệ số $\beta$ hiệu chỉnh thủ công.
+2. **Đảm bảo gradient** — attention từ HuggingFace thường detach (SDPA/flash-attn); dùng nó làm weight sẽ mất grad. Attention giờ chỉ chọn index (rời rạc, `no_grad`); weight tính từ `hidden_states` (luôn có grad) → toàn bộ $W$ student truyền gradient.
+
+**Công thức thống nhất** (áp dụng giống nhau cho Teacher và Student — build độc lập):
+
+$$
+w_{ij} = \frac{\exp\bigl(\cos(x_i, x_j)/\tau\bigr)}{\displaystyle\sum_{k \in \mathcal{N}(i)} \exp\bigl(\cos(x_i, x_k)/\tau\bigr)}, \qquad j \in \mathcal{N}(i)
+$$
+
+Ba loại cạnh **chỉ khác nhau ở cách chọn $\mathcal{N}(i)$**:
+
+| Cạnh | Giữa | $\mathcal{N}(i)$ | $\tau$ | Ghi chú |
+|------|------|------------------|--------|---------|
+| **Intra-cluster** | token ↔ token (cùng cụm) | Top-k theo **attention** @ ~80% | `segd_tau_intra` | Attention chỉ chọn index, không dùng làm weight |
+| **Local-to-global** | token ↔ super-node cụm | **Toàn bộ** token hợp lệ trong cụm | `segd_tau_local` | $R$ vẫn là mean-pool thật; chỉ **weight cạnh** đổi |
+| **Bridge** | $R_Q$ ↔ $\{R_P, R_{\text{Neg}}\}$ | $\{\text{Pos}\} \cup$ top-k hard-neg theo **cosine** | `segd_bridge_temperature` | Positive luôn trong candidate; neg nhận dấu âm thủ công |
 
 **Topology:**
-- Mỗi cụm có 1 đại diện = mean-pool token hợp lệ.
+- Mỗi cụm có 1 đại diện $R$ = mean-pool token hợp lệ @ ~80% hidden.
 - Query nối Positive **và** hard-negatives (Positive khác trong batch).
 - **Không** có cạnh Query–Query hay Positive–Positive.
 
-Bridge logits (giống attention):
+**Không cần ReLU trước softmax:** $\exp(\cdot)$ luôn dương dù cosine âm — softmax đảm bảo $w_{ij} > 0$. Dấu âm ở bridge-negative là **chủ đích thiết kế** (repulsion trong signed Laplacian), gán thủ công sau softmax: $w_{\text{neg}} = -\lambda_{\text{neg}} \cdot \alpha$.
+
+**Symmetrize toàn cục** (một lần sau khi gộp cả 3 loại cạnh):
 
 $$
-e_{ij} = \frac{R_{Q_i}\cdot R_{P_j}}{\sqrt{d}\,\tau_{\text{bridge}}}, \quad
-\alpha = \mathrm{softmax}(e_{\{pos\}\cup\text{topk-neg}})
+W \leftarrow \tfrac{1}{2}(W + W^{\top})
 $$
+
+Intra-cluster top-k theo attention **không đối xứng** ($j \in \mathcal{N}(i)$ chưa chắc $i \in \mathcal{N}(j)$). Symmetrize sau cùng có thể làm row-sum lệch nhẹ khỏi 1.0 — chấp nhận được vì Laplacian normalization ($D^{-1/2}WD^{-1/2}$, $D_{ii}=\sum_j|W_{ij}|$) tự re-scale theo degree thực tế.
+
+#### 3.2.1 Chi tiết từng loại cạnh
+
+**Intra-cluster** — `_build_attn_topk_index` chọn neighbor, `_cosine_softmax_weight` gán weight:
+
+```python
+# attention: chỉ index (no_grad)
+topk_idx = _build_attn_topk_index(attn_cluster, mask, k=segd_intra_topk)
+# weight: cosine + softmax trên hidden @ cùng layer window
+w = softmax(cos(hidden[i], hidden[neighbors]) / tau_intra)
+```
+
+**Local-to-global** — candidate = mọi token hợp lệ; trọng tâm $x_i = R$ (super-node):
+
+```python
+w = softmax(cos(R, hidden[valid_tokens]) / tau_local)   # sum = 1
+```
+
+**Bridge** — cosine (L2-normalize $R_q, R_p$), không scaled dot-product $1/\sqrt{d}$:
+
+$$
+\text{logits}_{ij} = \frac{\cos(R_{Q_i}, R_{P_j})}{\tau_{\text{bridge}}}, \quad
+\alpha = \mathrm{softmax}\bigl(\text{logits}_{\{pos\}\cup\text{topk-neg}}\bigr)
+$$
+
+Hard-negative: top-k theo cosine trong batch (không theo attention). Positive $i$ luôn nằm trong candidate dù không lọt top-k neg.
 
 ### 3.3 Assembly
 
-`assemble_graph` chạy **2 lần độc lập** (Teacher detach, Student giữ grad). Edge values giữ trong autograd (không `.item()`). Trả về dense $W$ (qua sparse COO coalesce), $N_{\text{total}}$, $R_q$, $R_p$.
+`assemble_graph` chạy **2 lần độc lập** (Teacher `no_grad`, Student giữ grad). Thứ tự mỗi sample: mean-pool $R_q, R_p$ → intra (qry + pos) → local-to-global (qry + pos) → sau vòng batch: bridge. Edge values giữ trong autograd (không `.item()`). `_DiffEdgeBuffer.to_dense()` gộp sparse COO, **symmetrize một lần** $W = \frac{1}{2}(W+W^\top)$, trả dense $W$, $N_{\text{total}}$, $R_q$, $R_p$.
 
 ### 3.4 Cross-model projection $P$ (chi tiết đầy đủ)
 
@@ -707,7 +752,7 @@ Ps = U_s[:, :k] @ U_s[:, :k].T
 loss = ((Pt - Ps) ** 2).sum() / N_s
 ```
 
-**Gradient:** chỉ qua $U_s$ → $L_s$ → $W_s$ → bridge / embeddings student. $P$, $U_t$, $W_t$ không grad.
+**Gradient:** chỉ qua $U_s$ → $L_s$ → $W_s$ → cosine edge weights → hidden @ ~80%. $P$, $U_t$, $W_t$ không grad.
 
 **Tại sao projector thay vì match eigenvector trực tiếp:** khi $\lambda_i \approx \lambda_{i+1}$, eigenvector xoay tự do trong subspace → gradient bất ổn. Projector $\sum_i v_i v_i^{\top}$ ổn định hơn.
 
@@ -749,15 +794,19 @@ Nguồn: [`src/arguments.py`](../src/arguments.py), script [`train_SEGD_fastvlm.
 | `kd_weight` | `--kd_weight` | `1.0` | Scale spectral KD |
 | `segd_depth_ratio` | `--segd_depth_ratio` | `0.8` | Layer attention (~80% depth) |
 | `segd_attn_window` | `--segd_attn_window` | `1` | ±window layers (3 layer khi =1) |
-| `segd_intra_topk` | `--segd_intra_topk` | `16` | Top-k neighbor intra-cluster |
+| `segd_intra_topk` | `--segd_intra_topk` | `16` | Top-k neighbor intra-cluster (attention chọn index) |
+| `segd_tau_intra` | `--segd_tau_intra` | `0.1` | Softmax temperature cho weight intra-cluster (cosine) |
+| `segd_tau_local` | `--segd_tau_local` | `0.1` | Softmax temperature cho weight local-to-global (cosine) |
 | `segd_lambda_neg` | `--segd_lambda_neg` | `0.3` | Scale + đổi dấu bridge âm |
-| `segd_k_neg` | `--segd_k_neg` | `8` | Hard-negatives mỗi Query |
-| `segd_bridge_temperature` | `--segd_bridge_temperature` | `1.0` | Softmax bridge |
+| `segd_k_neg` | `--segd_k_neg` | `8` | Hard-negatives mỗi Query (chọn theo cosine) |
+| `segd_bridge_temperature` | `--segd_bridge_temperature` | `1.0` | Softmax temperature cho weight bridge (cosine) |
 | `segd_k_eigen` | `--segd_k_eigen` | `32` | Số eigenvector KD |
 | `segd_use_graph_reps_contrastive` | `--segd_use_graph_reps_contrastive` | `False` | `False` → contrastive = `encode_input` pooling (khớp eval); `True` → graph $R_q,R_p$ @ ~80% |
 | `pooling` | `--pooling` | `mean` (SEGD script) | Inference + encode_input: `mean` / `eos` / `last` |
 | `teacher_patch_size` | `--teacher_patch_size` | `28` | Infer grid Teacher |
 | `student_patch_size` | `--student_patch_size` | `64` | Infer grid Student |
+
+Ba $\tau$ (`tau_intra`, `tau_local`, `bridge_temperature`) nên **để riêng**: số candidate mỗi loại cạnh khác nhau nhiều (~16 vs toàn cụm vs ~9) — cùng $\tau$ tạo độ "nhọn" hiệu dụng khác nhau.
 
 **Batch size:** graph dense $O((B\cdot N_{\mathrm{tok}})^2)$. Script mẫu dùng `B=4`, `gradient_accumulation_steps=4`. Scale lên cẩn thận (eigh student).
 
@@ -771,12 +820,19 @@ Các flag legacy (`w_loss_cka`, `w_loss_grounding`, `sekd_*` cũ, …) vẫn par
 
 | Key | Ý nghĩa |
 |-----|---------|
-| `loss` | Total |
+| `loss` | Total = `contrastive` + `kd_weight * spectral_kd` |
 | `contrastive_loss` | Symmetric InfoNCE student |
-| `segd_loss` / `spectral_kd_loss` | Spectral KD (cùng giá trị) |
-| `n_total_teacher` / `n_total_student` | Số node graph mỗi bên |
-| `batch_vision_nodes_qry` / `_pos` | Tổng vision tokens student (qry/pos) |
-| `batch_text_nodes_qry` / `_pos` | Tổng text tokens student |
+| `segd_loss` / `spectral_kd_loss` | Spectral KD raw (cùng giá trị) |
+| `kd_weighted` | `kd_weight * spectral_kd_loss` (đóng góp thực vào total) |
+| `kd_weight` | Hệ số scale KD |
+| `batch_size` | B local |
+| `n_total_teacher` / `n_total_student` | Số node graph (= Σ cluster + 2B super-node) |
+| `n_supernodes` | `2B` (`R_Q` + `R_P`) |
+| `t_vision/text_nodes_qry/pos` | Tổng node Teacher theo modal × cụm |
+| `t_cluster_nodes_qry/pos` | Tổng node Teacher mỗi cụm (vision+text) |
+| `s_vision/text_nodes_qry/pos` | Tổng node Student theo modal × cụm |
+| `s_cluster_nodes_qry/pos` | Tổng node Student mỗi cụm |
+| `batch_vision/text_nodes_*` | Alias student (giữ tương thích) |
 | `segd_attn_layer` | Layer center attention đã chọn |
 | `segd_k_eigen` | $k$ eigenvector thực dùng |
 
@@ -788,9 +844,9 @@ Các flag legacy (`w_loss_cka`, `w_loss_grounding`, `sekd_*` cũ, …) vẫn par
 |------------|---------------|
 | Teacher forward / $W_t$ / $U_t$ | ✗ (`no_grad` + detach) |
 | $P$ (FRA / char-overlap) | ✗ (geometry-only) |
-| Intra-cluster attention | Thường ✗ (HF attentions detach); nếu có grad thì qua $W_s$ |
-| Node hidden @ ~80% | ✓ (extract → mean-pool $R_q,R_p$, local-to-global) |
-| Bridge từ $R_q,R_p$ | ✓ |
+| Attention top-k index (intra topology) | ✗ (`no_grad` — chỉ chọn neighbor) |
+| Edge weights (cosine softmax trên hidden) | ✓ (intra + local-to-global + bridge) |
+| Node hidden @ ~80% | ✓ (mean-pool $R_q,R_p$, weight mọi cạnh) |
 | Contrastive bidirectional | ✓ |
 | `eigh(L_s)` | ✓ (dense); `lobpcg` chỉ Teacher |
 
@@ -817,7 +873,9 @@ Các flag legacy (`w_loss_cka`, `w_loss_grounding`, `sekd_*` cũ, …) vẫn par
 | Graph scope | Per-sample, 3 graph $G_v,G_t,G_{vt}$ | Một batch graph qry+pos |
 | Node text | Align word-level sau spectral | Native subword + char-overlap trong $P$ |
 | Node vision | Align bilinear → $H_0\times W_0$ | Native patch + FRA trong $P$ |
-| Intra edges | kNN trên embedding | Attention @ ~80% depth |
+| Intra edges | kNN trên embedding | Attention chọn top-k @ ~80%; weight = cosine softmax |
+| Local-to-global | Cố định $1/n$ hoặc uniform | Cosine softmax token ↔ $R$ |
+| Bridge weight | Scaled dot-product | Cosine softmax; neg signed |
 | Cross-sample | Không | Bridge Q↔{Pos, hard-Neg} signed |
 | CKA / Grounding | Có | Bỏ |
 | Total loss | contrastive + KD + CKA + grounding | contrastive + spectral KD |
