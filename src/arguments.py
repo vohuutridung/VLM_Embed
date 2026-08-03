@@ -10,7 +10,10 @@ class ModelArguments:
     processor_name: str = field(default=None, metadata={"help": "processor_name, huggingface model name or path"})
     model_backbone: str = field(default=None, metadata={"help": "HF model type"})
     checkpoint_path: str = field(default=None, metadata={"help": "a local model path, could be a LoRA version"})
-    pooling: str = field(default='last', metadata={"help": "pooling method for encoder"})
+    pooling: str = field(
+        default='last',
+        metadata={"help": "pooling method for encoder: 'last'/'eos' (last non-pad token) or 'mean' (masked mean)"},
+    )
     normalize: bool = field(default=False, metadata={"help": "normalize query and passage representations"})
     temperature: float = field(default=0.02, metadata={"help": "temperature for softmax"})
     lora: bool = field(default=False, metadata={"help": "do parameter-efficient fine-tuning with lora"})
@@ -147,64 +150,69 @@ class TrainingArguments(TrainingArguments):
         default=0.1,
         metadata={"help": "temperature for local cross-modal affinity softmax"},
     )
-    # SEKD / SEGDLoss
+    # SEGDLoss — Spectral KD + Star-Bridge graph
+    segd_depth_ratio: float = field(
+        default=0.8,
+        metadata={"help": "attention layer depth ratio for intra-cluster edges (~80%)"},
+    )
+    segd_attn_window: int = field(
+        default=1,
+        metadata={"help": "half-window of layers averaged around depth_ratio (window=1 → 3 layers)"},
+    )
+    segd_intra_topk: int = field(
+        default=16,
+        metadata={"help": "top-k neighbors per token for intra-cluster attention sparsify"},
+    )
+    segd_lambda_neg: float = field(
+        default=0.3,
+        metadata={"help": "scale (and sign flip) for negative bridge edge weights"},
+    )
+    segd_k_neg: int = field(
+        default=8,
+        metadata={"help": "number of hard-negative bridges per query in star-bridge graph"},
+    )
+    segd_bridge_temperature: float = field(
+        default=1.0,
+        metadata={"help": "softmax temperature for Query→{Pos,Neg} bridge attention weights"},
+    )
+    segd_k_eigen: int = field(
+        default=32,
+        metadata={"help": "number of Laplacian eigenvectors for spectral KD"},
+    )
+    segd_use_graph_reps_contrastive: bool = field(
+        default=False,
+        metadata={
+            "help": "If True, contrastive uses star-bridge mean-pool R_q/R_p (~80% depth cluster). "
+            "If False (default), uses encode_input pooling — match inference "
+            "(recommend --pooling mean for train+eval)."
+        },
+    )
+    # Legacy SEKD flags (kept for CLI compat; unused by current SEGDLoss)
     w_loss_cka: float = field(
         default=1.0,
-        metadata={"help": "weight for batch-level CKA loss in SEGDLoss"},
+        metadata={"help": "[unused] legacy CKA weight"},
     )
     cka_pooling: str = field(
         default="last",
-        metadata={
-            "help": "Global embedding pooling for SEGDLoss CKA: "
-            "'mean' (masked mean over valid tokens) or 'last'/'eos' (last non-pad hidden)"
-        },
+        metadata={"help": "[unused] legacy CKA pooling"},
     )
-    sekd_k_min: int = field(
-        default=2,
-        metadata={"help": "minimum adaptive eigenmap dimension k_g for SEKD"},
-    )
-    sekd_k_max: int = field(
-        default=16,
-        metadata={"help": "maximum adaptive eigenmap dimension k_g for SEKD"},
-    )
-    sekd_eig_eps: float = field(
-        default=1e-6,
-        metadata={"help": "eigenvalue threshold for Laplacian nullity in SEKD"},
-    )
-    sekd_align_grid_h: int = field(
-        default=10,
-        metadata={"help": "shared vision eigenmap grid height (H0) for post-spectral alignment"},
-    )
-    sekd_align_grid_w: int = field(
-        default=10,
-        metadata={"help": "shared vision eigenmap grid width (W0) for post-spectral alignment"},
-    )
-    w_loss_grounding: float = field(
-        default=0.5,
-        metadata={"help": "weight for Semantic Grounding Distillation (KL on G_vt c_ij) in SEGDLoss"},
-    )
+    sekd_k_min: int = field(default=2, metadata={"help": "[unused] legacy SEKD k_min"})
+    sekd_k_max: int = field(default=16, metadata={"help": "[unused] legacy SEKD k_max"})
+    sekd_eig_eps: float = field(default=1e-6, metadata={"help": "[unused] legacy SEKD eig eps"})
+    sekd_align_grid_h: int = field(default=10, metadata={"help": "[unused] legacy align grid H"})
+    sekd_align_grid_w: int = field(default=10, metadata={"help": "[unused] legacy align grid W"})
+    w_loss_grounding: float = field(default=0.5, metadata={"help": "[unused] legacy grounding weight"})
     w_loss_grounding_warmup_steps: int = field(
-        default=0,
-        metadata={
-            "help": "Linear warmup steps for w_loss_grounding (0→target). "
-            "If > 0, overrides w_loss_grounding_warmup_ratio. "
-            "0 with ratio=0 disables warmup (constant weight from step 0)."
-        },
+        default=0, metadata={"help": "[unused] legacy grounding warmup steps"},
     )
     w_loss_grounding_warmup_ratio: float = field(
-        default=0.0,
-        metadata={
-            "help": "Fraction of total optimizer steps for grounding weight warmup "
-            "(e.g. 0.15 = 15%%). Used only when w_loss_grounding_warmup_steps is 0."
-        },
+        default=0.0, metadata={"help": "[unused] legacy grounding warmup ratio"},
     )
     sekd_grounding_temp: float = field(
-        default=0.1,
-        metadata={"help": "softmax temperature tau_grounding for Semantic Grounding Distillation"},
+        default=0.1, metadata={"help": "[unused] legacy grounding temperature"},
     )
     sekd_grounding_bidirectional: bool = field(
-        default=True,
-        metadata={"help": "if True, average vision→text and text→vision KL in grounding loss"},
+        default=True, metadata={"help": "[unused] legacy grounding bidirectional flag"},
     )
     wandb_api_key: str = field(
         default="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",

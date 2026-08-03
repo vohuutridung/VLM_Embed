@@ -180,9 +180,14 @@ class MMEBModel(nn.Module):
                 # Get the vectors at the last 1 position of each attention mask
                 reps = last_hidden_state[
                     torch.arange(batch_size, device=last_hidden_state.device), eos_indices_positive]
-
+        elif self.pooling == 'mean':
+            # Masked mean over all non-padding tokens (vision + text).
+            mask = attention_mask.unsqueeze(-1).to(dtype=last_hidden_state.dtype)
+            reps = (last_hidden_state * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1e-8)
         else:
-            raise NotImplementedError
+            raise NotImplementedError(
+                f"Unsupported pooling={self.pooling!r}; choose 'last', 'eos', or 'mean'."
+            )
         if self.normalize:
             reps = torch.nn.functional.normalize(reps, p=2, dim=-1)
         return reps
